@@ -6,4 +6,9 @@ pool = ConnectionPool(os.environ["DATABASE_URL"], min_size=1, max_size=5, open=T
 
 def initialize():
     with pool.connection() as conn:
-        conn.execute(Path("migrations/001_initial.sql").read_text())
+        conn.execute("SELECT pg_advisory_xact_lock(781232019)")
+        conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())")
+        for migration in sorted(Path("migrations").glob("*.sql")):
+            claimed=conn.execute("INSERT INTO schema_migrations(version) VALUES(%s) ON CONFLICT DO NOTHING RETURNING version",(migration.stem,)).fetchone()
+            if claimed:
+                conn.execute(migration.read_text())

@@ -32,9 +32,14 @@ class Fields(BaseModel): fields:list[str]
 class CellTranslation(BaseModel):
     store:str=Field(pattern=r'^[A-Z0-9_-]{2,12}$')
     resource_id:str=Field(min_length=8,max_length=255)
+    owner_id:str=Field(min_length=8,max_length=255)
     locale:str=Field(min_length=2,max_length=20)
     key:str=Field(min_length=1,max_length=255)
     value:str=Field(max_length=200000)
+    namespace:str|None=Field(default=None,max_length=255)
+    metafield_key:str|None=Field(default=None,max_length=255)
+    metafield_type:str|None=Field(default=None,max_length=100)
+    compare_digest:str|None=Field(default=None,max_length=255)
 class StoreConfig(BaseModel):
     code:str=Field(pattern=r'^[A-Z0-9_-]{2,12}$')
     domain:str=Field(min_length=3,max_length=255)
@@ -60,7 +65,7 @@ def shopify_graphql(domain, token, query, variables=None):
     if data.get('errors'): raise HTTPException(502,'Shopify GraphQL: '+str(data['errors'][0].get('message','error'))[:250])
     return data.get('data',{})
 
-PRODUCT_SELECTION='''id title descriptionHtml handle vendor productType status tags createdAt updatedAt seo { title description } featuredMedia { preview { image { url altText } } } images(first:50) { nodes { id url altText } } variants(first:100) { nodes { id title sku barcode } pageInfo { hasNextPage endCursor } } metafields(first:100) { nodes { id namespace key type value description } pageInfo { hasNextPage endCursor } }'''
+PRODUCT_SELECTION='''id title descriptionHtml handle vendor productType status tags createdAt updatedAt seo { title description } featuredMedia { preview { image { url altText } } } images(first:50) { nodes { id url altText } } variants(first:100) { nodes { id title sku barcode } pageInfo { hasNextPage endCursor } } metafields(first:100) { nodes { id namespace key type value compareDigest description } pageInfo { hasNextPage endCursor } }'''
 
 def shopify_stores():
     with pool.connection() as c:
@@ -100,7 +105,7 @@ def shopify_find_by_id(store, identifier):
 def shopify_product(store, gid, locales):
     tr=' '.join(f't{n}:translations(locale:{json.dumps(locale)}) {{ key value outdated }}' for n,locale in enumerate(locales))
     mf_tr=' '.join(f'mt{n}:translations(locale:{json.dumps(locale)}) {{ key value outdated }}' for n,locale in enumerate(locales))
-    selection=PRODUCT_SELECTION.replace('metafields(first:100) { nodes { id namespace key type value description } }',f'metafields(first:100) {{ nodes {{ id namespace key type value description {mf_tr} }} }}')
+    selection=PRODUCT_SELECTION.replace('metafields(first:100) { nodes { id namespace key type value compareDigest description } }',f'metafields(first:100) {{ nodes {{ id namespace key type value compareDigest description {mf_tr} }} }}')
     q=f'''query ProductRead($id:ID!) {{ product(id:$id) {{ {selection} {tr} }} }}'''
     translation_error=None
     try: data=shopify_graphql(store['domain'],store['token'],q,{'id':gid}).get('product')
@@ -119,7 +124,7 @@ def shopify_product(store, gid, locales):
         def collect_connection(owner_id, field, initial):
             nodes=list(initial.get('nodes',[])); page=initial.get('pageInfo',{})
             while page.get('hasNextPage'):
-                query=f'''query MetafieldPage($id:ID!,$after:String) {{ node(id:$id) {{ ... on {"Product" if field=="metafields" and owner_id==gid else "ProductVariant"} {{ {field}(first:100,after:$after) {{ nodes {{ id namespace key type value description {mf_selection()} }} pageInfo {{ hasNextPage endCursor }} }} }} }} }}'''
+                query=f'''query MetafieldPage($id:ID!,$after:String) {{ node(id:$id) {{ ... on {"Product" if field=="metafields" and owner_id==gid else "ProductVariant"} {{ {field}(first:100,after:$after) {{ nodes {{ id namespace key type value compareDigest description {mf_selection()} }} pageInfo {{ hasNextPage endCursor }} }} }} }} }}'''
                 owner=shopify_graphql(store['domain'],store['token'],query,{'id':owner_id,'after':page.get('endCursor')}).get('node') or {}
                 connection=owner.get(field,{})
                 nodes.extend(connection.get('nodes',[])); page=connection.get('pageInfo',{})
@@ -147,6 +152,13 @@ def shopify_locale_code(locale, store_code=''):
     # Shopify requires the locale tag enabled on that exact shop. Never infer
     # it from a country/store code (for example, es-MX may be es or es-419).
     return locale
+
+def is_nl_pt_locale(locale):
+    return locale.replace('_','-').split('-')[0].casefold() in ('nl','pt')
+
+def shopify_shop_locales(store):
+    query='''query EnabledShopLocales { shopLocales { locale name primary published } }'''
+    return shopify_graphql(store['domain'],store['token'],query).get('shopLocales',[])
 
 def product_field_value(product, key):
     if not product: return ''
@@ -193,7 +205,8 @@ def stores_page():
     body='''<main class="wrap"><h1>Tiendas Shopify</h1><p class="lede">Configura las conexiones y los idiomas disponibles para cada tienda.</p><div id="stores" class="grid"><div class="card">Cargando tiendas…</div></div><section class="card"><h2>Añadir tienda</h2><form id="store-form"><div class="grid"><div class="field"><label for="code">Código</label><input id="code" placeholder="FR" pattern="[A-Z0-9_-]{2,12}" required></div><div class="field"><label for="domain">Dominio Shopify</label><input id="domain" placeholder="mi-tienda.myshopify.com" required></div><div class="field"><label for="token">Token de acceso Admin API</label><input id="token" type="password" autocomplete="new-password" placeholder="shpat_…"></div><div class="field"><label for="locales">Locales (separados por coma)</label><input id="locales" placeholder="fr-FR, en-GB"></div></div><div class="actions"><button>Guardar tienda</button><span id="message" class="status" role="status"></span></div></form><p class="muted">Los tokens se guardan en la base de datos de esta instancia. El token vacío conserva el actual al editar.</p></section></main>
 <script>
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-async function loadStores(){const r=await fetch('/api/stores');const data=await r.json();document.querySelector('#stores').innerHTML=data.map(s=>`<article class="card"><span class="badge">${s.active?'ACTIVA':'INACTIVA'}</span><h2>${esc(s.code)}</h2><p>${esc(s.domain||'Dominio sin configurar')}</p><p class="muted">Token: ${s.has_token?'•••••••• configurado':'sin configurar'} · Locales configurados: ${esc(s.locales.join(', ')||'ninguno')}</p><button class="secondary" data-code="${esc(s.code)}">Editar configuración</button> <button class="secondary" data-fetch-locales="${esc(s.code)}" ${!s.active||!s.has_token?'disabled':''}>Consultar locales Shopify</button><div class="muted" id="shop-locales-${esc(s.code)}"></div></article>`).join('')||'<div class="card">No hay tiendas configuradas.</div>';document.querySelectorAll('[data-code]').forEach(b=>b.addEventListener('click',()=>editStore(data.find(s=>s.code===b.dataset.code))));document.querySelectorAll('[data-fetch-locales]').forEach(button=>button.addEventListener('click',async()=>{const s=data.find(item=>item.code===button.dataset.fetchLocales),panel=document.querySelector('#shop-locales-'+s.code);panel.textContent='Consultando Shopify…';const response=await fetch('/api/stores/'+encodeURIComponent(s.code)+'/shop-locales'),result=await response.json();if(!response.ok){panel.textContent=result.detail||'No se pudieron consultar los locales';return}const secondary=result.filter(item=>item.published&&!item.primary);panel.innerHTML='<p><strong>Locales habilitados en Shopify:</strong></p><ul>'+result.map(item=>`<li><code>${esc(item.locale)}</code> · ${esc(item.name)}${item.primary?' · principal':''}${item.published?' · publicado':' · no publicado'}</li>`).join('')+'</ul><button type="button" class="secondary use-shop-locales">Cargar secundarios publicados</button>';panel.querySelector('.use-shop-locales').addEventListener('click',()=>{editStore(s);document.querySelector('#locales').value=secondary.map(item=>item.locale).join(', ')})}))}
+function isNlPt(locale){return ['nl','pt'].includes(String(locale).replace('_','-').split('-')[0].toLowerCase())}
+async function loadStores(){const r=await fetch('/api/stores');const data=await r.json();document.querySelector('#stores').innerHTML=data.map(s=>`<article class="card"><span class="badge">${s.active?'ACTIVA':'INACTIVA'}</span><h2>${esc(s.code)}</h2><p>${esc(s.domain||'Dominio sin configurar')}</p><p class="muted">Token: ${s.has_token?'•••••••• configurado':'sin configurar'} · Locales configurados: ${esc(s.locales.join(', ')||'ninguno')}</p><button class="secondary" data-code="${esc(s.code)}">Editar configuración</button> <button class="secondary" data-fetch-locales="${esc(s.code)}" ${!s.active||!s.has_token?'disabled':''}>Consultar locales Shopify</button><div class="muted" id="shop-locales-${esc(s.code)}"></div></article>`).join('')||'<div class="card">No hay tiendas configuradas.</div>';document.querySelectorAll('[data-code]').forEach(b=>b.addEventListener('click',()=>editStore(data.find(s=>s.code===b.dataset.code))));document.querySelectorAll('[data-fetch-locales]').forEach(button=>button.addEventListener('click',async()=>{const s=data.find(item=>item.code===button.dataset.fetchLocales),panel=document.querySelector('#shop-locales-'+s.code);panel.textContent='Consultando Shopify…';const response=await fetch('/api/stores/'+encodeURIComponent(s.code)+'/shop-locales'),result=await response.json();if(!response.ok){panel.textContent=result.detail||'No se pudieron consultar los locales';return}const selected=result.filter(item=>item.published&&(item.primary||isNlPt(item.locale)));panel.innerHTML='<p><strong>Locales habilitados en Shopify:</strong></p><ul>'+result.map(item=>`<li><code>${esc(item.locale)}</code> · ${esc(item.name)}${item.primary?' · principal':''}${item.published?' · publicado':' · no publicado'}</li>`).join('')+'</ul><button type="button" class="secondary use-shop-locales">Cargar principal y locales NL/PT publicados</button>';panel.querySelector('.use-shop-locales').addEventListener('click',()=>{editStore(s);document.querySelector('#locales').value=selected.map(item=>item.locale).join(', ')})}))}
 function editStore(s){document.querySelector('#code').value=s.code;document.querySelector('#code').readOnly=true;document.querySelector('#domain').value=s.domain||'';document.querySelector('#token').value='';document.querySelector('#locales').value=s.locales.join(', ');window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'})}
 document.querySelector('#store-form').addEventListener('submit',async e=>{e.preventDefault();const payload={code:document.querySelector('#code').value.trim().toUpperCase(),domain:document.querySelector('#domain').value.trim(),token:document.querySelector('#token').value,locales:document.querySelector('#locales').value.split(',').map(x=>x.trim()).filter(Boolean)};const r=await fetch('/api/stores',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const m=document.querySelector('#message');if(r.ok){m.textContent='Configuración guardada';document.querySelector('#store-form').reset();document.querySelector('#code').readOnly=false;loadStores()}else{const x=await r.json();m.textContent=x.detail||'No se pudo guardar'}});loadStores();
 </script>'''
@@ -209,8 +222,7 @@ def list_stores():
 def shop_locales(code:str):
     store=next((item for item in shopify_stores() if item['code']==code),None)
     if not store or not store['token']: raise HTTPException(404,'Tienda inactiva o sin credenciales Shopify')
-    query='''query EnabledShopLocales { shopLocales { locale name primary published } }'''
-    locales=shopify_graphql(store['domain'],store['token'],query).get('shopLocales',[])
+    locales=shopify_shop_locales(store)
     return sorted(locales,key=lambda item:(not item.get('primary',False),item.get('locale','')))
 
 @app.get('/products',response_class=HTMLResponse)
@@ -238,9 +250,9 @@ def product_browser(q:str='',source_id:str=''):
                     cells.append(f'<td>{shown}</td>')
                 rows.append(f'<tr><th>{esc(f["label"])}<br><code>{esc(f["key"])}</code></th>{"".join(cells)}</tr>')
             notices=''.join(f'<p class="muted">{esc(n)}</p>' for n in data['notices'])
-            detail=f'''<section class="card"><h2>Comparación del producto</h2><p class="lede">Selecciona “Editar celda” para guardar una traducción en esa tienda y ese idioma. En descripciones, el editor conserva el HTML.</p><h3>{esc(data['source']['title'])}</h3><p class="muted">SKU: {esc(data['source']['sku'] or '—')} · {esc(data['source']['id'])}</p>{notices}<div class="comparison-scroll"><table><thead><tr><th>Campo</th>{cols}</tr></thead><tbody>{''.join(rows)}</tbody></table></div><dialog class="edit-dialog" id="cell-editor"><form method="dialog" id="cell-edit-form"><h2>Editar traducción</h2><p id="edit-context" class="muted"></p><p class="html-note muted">La descripción se guarda como HTML. Puedes editar etiquetas como &lt;p&gt;, &lt;ul&gt; y &lt;strong&gt;.</p><textarea id="edit-value" aria-label="Traducción"></textarea><div class="actions"><button type="submit" id="save-cell">Guardar en Shopify</button><button type="button" class="secondary" id="cancel-cell">Cancelar</button><span id="edit-status" class="status" role="status"></span></div></form></dialog></section><script>
+            detail=f'''<section class="card"><h2>Comparación del producto</h2><p class="lede">Los locales secundarios de NL y PT guardan traducciones. Las demás tiendas actualizan el contenido de su locale principal. En descripciones, el editor conserva el HTML.</p><h3>{esc(data['source']['title'])}</h3><p class="muted">SKU: {esc(data['source']['sku'] or '—')} · {esc(data['source']['id'])}</p>{notices}<div class="comparison-scroll"><table><thead><tr><th>Campo</th>{cols}</tr></thead><tbody>{''.join(rows)}</tbody></table></div><dialog class="edit-dialog" id="cell-editor"><form method="dialog" id="cell-edit-form"><h2>Editar contenido</h2><p id="edit-context" class="muted"></p><p class="html-note muted">La descripción se guarda como HTML. Puedes editar etiquetas como &lt;p&gt;, &lt;ul&gt; y &lt;strong&gt;.</p><textarea id="edit-value" aria-label="Contenido"></textarea><div class="actions"><button type="submit" id="save-cell">Guardar en Shopify</button><button type="button" class="secondary" id="cancel-cell">Cancelar</button><span id="edit-status" class="status" role="status"></span></div></form></dialog></section><script>
 const editor=document.querySelector('#cell-editor'),form=document.querySelector('#cell-edit-form'),area=document.querySelector('#edit-value');let editTarget=null;
-document.querySelectorAll('.cell-edit').forEach(button=>button.addEventListener('click',()=>{{editTarget=JSON.parse(button.dataset.edit);area.value=editTarget.value||'';document.querySelector('#edit-context').textContent=editTarget.store+' · '+editTarget.locale+' · '+editTarget.key;editor.classList.toggle('html-mode',editTarget.key==='body_html');document.querySelector('#edit-status').textContent='';editor.showModal()}}));
+document.querySelectorAll('.cell-edit').forEach(button=>button.addEventListener('click',()=>{{editTarget=JSON.parse(button.dataset.edit);area.value=editTarget.value||'';document.querySelector('#edit-context').textContent=editTarget.store+' · '+editTarget.locale+' · '+editTarget.key+' · '+(editTarget.mode==='base'?'Contenido base':'Traducción');editor.classList.toggle('html-mode',editTarget.key==='body_html');document.querySelector('#edit-status').textContent='';editor.showModal()}}));
 document.querySelectorAll('.more').forEach(button=>button.addEventListener('click',()=>{{button.previousElementSibling.textContent=button.dataset.full;button.remove()}}));
 document.querySelector('#cancel-cell').addEventListener('click',()=>editor.close());
 form.addEventListener('submit',async event=>{{event.preventDefault();if(!editTarget)return;const save=document.querySelector('#save-cell'),status=document.querySelector('#edit-status');save.disabled=true;status.textContent='Guardando…';const response=await fetch('/api/shopify/translations',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{...editTarget,value:area.value}})}});const result=await response.json();save.disabled=false;if(response.ok){{status.textContent='Guardado';location.reload()}}else status.textContent=result.detail||'No se pudo guardar'}});
@@ -331,15 +343,24 @@ def compare_shopify_product(source_id:str):
     sku=next((v.get('sku') for v in source.get('variants',{}).get('nodes',[]) if v.get('sku')),'')
     targets=[]; notices=[]
     if source.get('translation_error'): notices.append('Shopify no devolvió las traducciones de los locales configurados en ES; esos valores aparecerán vacíos.')
+    primary_locales={}
+    for store in stores:
+        if not store['token']: continue
+        try:
+            primary=next((item['locale'] for item in shopify_shop_locales(store) if item.get('primary')),None)
+            if primary: primary_locales[store['code']]=primary
+        except HTTPException as exc:
+            notices.append(f'{store["code"]}: no se pudo identificar el locale principal ({exc.detail}); sus celdas no serán editables hasta configurar read_locales.')
     with pool.connection() as c:
         mapping_rows=c.execute("SELECT dst.store_code,dst.shopify_product_gid FROM store_products src JOIN store_products dst USING(product_key) WHERE src.store_code='ES' AND src.shopify_product_gid=%s AND dst.store_code<>'ES' AND dst.mapping_status='CONFIRMED'",(source_id,)).fetchall()
     # Prefer mappings tied to this Spanish product. If none exists, try its SKU in each store.
     known={code:gid for code,gid in mapping_rows}
     for locale in source_locales:
-        if locale.lower() not in ('es-es','es'):
+        if locale!=primary_locales.get('ES') and locale.lower() not in ('es-es','es'):
             resolved=shopify_locale_code(locale)
             label=f'ES · {locale}'+(f' (Shopify {resolved})' if resolved!=locale else '')
-            targets.append({'store':'ES','domain':source_store['domain'],'locale':locale,'lookup_locale':resolved,'label':label,'product':source})
+            mode='translation' if is_nl_pt_locale(locale) and primary_locales.get('ES') and locale!=primary_locales['ES'] else 'readonly'
+            targets.append({'store':'ES','domain':source_store['domain'],'locale':locale,'lookup_locale':resolved,'label':label,'product':source,'mode':mode})
     for store in stores:
         if store['code']=='ES': continue
         locales=store['locales']
@@ -364,7 +385,9 @@ def compare_shopify_product(source_id:str):
             for locale in locales:
                 resolved=locale_map[locale]
                 label=f'{store["code"]} · {locale}'+(f' (Shopify {resolved})' if resolved!=locale else '')
-                targets.append({'store':store['code'],'domain':store['domain'],'locale':locale,'lookup_locale':resolved,'label':label,'product':candidate,'uses_base_fields':store['domain']!=source_store['domain']})
+                primary=primary_locales.get(store['code'])
+                mode='base' if primary and locale==primary else 'translation' if store['code'] in ('NL','PT') and is_nl_pt_locale(locale) and primary and locale!=primary else 'readonly'
+                targets.append({'store':store['code'],'domain':store['domain'],'locale':locale,'lookup_locale':resolved,'label':label,'product':candidate,'uses_base_fields':store['domain']!=source_store['domain'],'mode':mode})
         if candidate and candidate.get('translation_error'):
             notices.append(f'{store["code"]}: se muestran los campos actuales de la tienda; Shopify no devolvió sus traducciones registradas.')
     # ES, NL, and PT are configured as codes/markets for the same Shopify shop.
@@ -386,11 +409,11 @@ def compare_shopify_product(source_id:str):
         edits=[None]
         for target in targets:
             product=target['product']; tr=translations(product,target['lookup_locale'])
-            value=tr.get(keymap[key],'')
-            if not value and target.get('uses_base_fields'): value=product_field_value(product,key)
+            value=product_field_value(product,key) if target['mode']=='base' else tr.get(keymap[key],'')
+            if not value and target.get('uses_base_fields') and target['mode']=='translation': value=product_field_value(product,key)
             values.append(value)
             editable={'title','body_html','handle','seo_title','seo_description','vendor','product_type'}
-            edits.append({'store':target['store'],'resource_id':product['id'],'locale':target['lookup_locale'],'key':keymap[key],'value':value} if product and keymap.get(key) in editable else None)
+            edits.append({'store':target['store'],'resource_id':product['id'],'owner_id':product['id'],'locale':target['lookup_locale'],'key':keymap[key],'value':value,'mode':target['mode']} if product and target['mode']!='readonly' and keymap.get(key) in editable else None)
         fields.append({'key':key,'label':key.replace('.',' / '),'values':values,'edits':edits})
     # Rows are defined by the Spanish source. A missing key and an empty value
     # are shown distinctly in every destination.
@@ -416,9 +439,9 @@ def compare_shopify_product(source_id:str):
                 edits.append(None)
                 continue
             dest=next((item for item in (target['product'] or {}).get('metafields',{}).get('nodes',[]) if item['namespace']==namespace and item['key']==mfkey and not is_yotpo(item)),None)
-            values.append(mf_value(dest,target['product'],target['lookup_locale']))
-            value=mf_value_raw(dest,target['lookup_locale']) if dest else ''
-            edits.append({'store':target['store'],'resource_id':dest['id'],'locale':target['lookup_locale'],'key':'value','value':value} if dest and dest.get('type') in {'single_line_text_field','multi_line_text_field','rich_text_field','html'} else None)
+            raw_mf_value=mf_value_raw(dest,target['lookup_locale'] if target['mode']=='translation' else None) if dest else None
+            values.append(mf_value(dest,target['product'],target['lookup_locale'] if target['mode']=='translation' else None))
+            edits.append({'store':target['store'],'resource_id':dest['id'],'owner_id':target['product']['id'],'locale':target['lookup_locale'],'key':'value','value':raw_mf_value,'namespace':namespace,'metafield_key':mfkey,'metafield_type':dest.get('type'),'compare_digest':dest.get('compareDigest'),'mode':target['mode']} if dest and target['mode']!='readonly' and dest.get('type') in {'single_line_text_field','multi_line_text_field','rich_text_field','html'} else None)
         fields.append({'key':key,'label':f'Producto · {namespace} / {mfkey} ({mf.get("type","")})','values':values,'edits':edits})
     for source_variant in source_variants:
         variant_mfs=[item for item in source_variant.get('metafields',{}).get('nodes',[]) if not is_yotpo(item)]
@@ -436,9 +459,9 @@ def compare_shopify_product(source_id:str):
                     continue
                 dest_variant=next((v for v in (target['product'] or {}).get('variants',{}).get('nodes',[]) if (v.get('sku') or v.get('title') or v['id'])==identity),None)
                 dest_mf=next((item for item in (dest_variant or {}).get('metafields',{}).get('nodes',[]) if item['namespace']==namespace and item['key']==mfkey and not is_yotpo(item)),None)
-                values.append(mf_value(dest_mf,target['product'],target['lookup_locale']))
-                value=mf_value_raw(dest_mf,target['lookup_locale']) if dest_mf else ''
-                edits.append({'store':target['store'],'resource_id':dest_mf['id'],'locale':target['lookup_locale'],'key':'value','value':value} if dest_mf and dest_mf.get('type') in {'single_line_text_field','multi_line_text_field','rich_text_field','html'} else None)
+                raw_mf_value=mf_value_raw(dest_mf,target['lookup_locale'] if target['mode']=='translation' else None) if dest_mf else None
+                values.append(mf_value(dest_mf,target['product'],target['lookup_locale'] if target['mode']=='translation' else None))
+                edits.append({'store':target['store'],'resource_id':dest_mf['id'],'owner_id':dest_variant['id'] if dest_variant else '', 'locale':target['lookup_locale'],'key':'value','value':raw_mf_value,'namespace':namespace,'metafield_key':mfkey,'metafield_type':dest_mf.get('type'),'compare_digest':dest_mf.get('compareDigest'),'mode':target['mode']} if dest_mf and target['mode']!='readonly' and dest_mf.get('type') in {'single_line_text_field','multi_line_text_field','rich_text_field','html'} else None)
             fields.append({'key':key,'label':f'Variante · {identity_label} · {namespace} / {mfkey} ({mf.get("type","")})','values':values,'edits':edits})
     columns=[{'label':'ES · español (base)'}]+[{'label':t['label']} for t in targets]
     if not sku: notices.append('El producto de ES no tiene SKU; no se pudo proponer una correspondencia automática en otras tiendas.')
@@ -452,7 +475,45 @@ def save_shopify_translation(x:CellTranslation,user=Depends(operator)):
     if not store or not store['token']: raise HTTPException(404,'Tienda sin configurar')
     allowed_locales={shopify_locale_code(locale,store['code']) for locale in store['locales']}
     if x.locale not in allowed_locales: raise HTTPException(400,'El idioma no está configurado en esa tienda')
+    enabled_locales=shopify_shop_locales(store)
+    shop_locale=next((item for item in enabled_locales if item.get('locale')==x.locale),None)
+    if not shop_locale: raise HTTPException(400,'El locale no está habilitado en Shopify: '+', '.join(item.get('locale','') for item in enabled_locales))
+    special_translation=x.store in ('ES','NL','PT') and is_nl_pt_locale(x.locale)
+    if x.store=='ES':
+        if not special_translation or shop_locale.get('primary'):
+            raise HTTPException(400,'Desde ES solo se guardan traducciones secundarias para NL y PT')
+        mode='translation'
+    elif shop_locale.get('primary'):
+        mode='base'
+    elif special_translation:
+        mode='translation'
+    else:
+        raise HTTPException(400,'En esta tienda solo se edita el locale principal; las traducciones están reservadas a NL y PT')
     resource_type=x.resource_id.removeprefix('gid://shopify/')
+    if mode=='base':
+        if resource_type.startswith('Metafield/'):
+            if x.key!='value' or not x.namespace or not x.owner_id.startswith(('gid://shopify/Product/','gid://shopify/ProductVariant/')) or x.metafield_type not in {'single_line_text_field','multi_line_text_field','rich_text_field','html'}:
+                raise HTTPException(400,'Datos de metacampo no válidos para editar el contenido base')
+            mutation='''mutation SetBaseMetafield($metafields:[MetafieldsSetInput!]!) { metafieldsSet(metafields:$metafields) { userErrors { field message } } }'''
+            if not x.metafield_key: raise HTTPException(400,'Falta la clave Shopify del metacampo')
+            variables={'metafields':[{'ownerId':x.owner_id,'namespace':x.namespace,'key':x.metafield_key,'type':x.metafield_type,'value':x.value,'compareDigest':x.compare_digest}]}
+            result=shopify_graphql(store['domain'],store['token'],mutation,variables).get('metafieldsSet') or {}
+            errors=result.get('userErrors',[])
+            if errors: raise HTTPException(400,'Shopify: '+'; '.join(error.get('message','error') for error in errors)[:500])
+            return {'store':x.store,'resource_id':x.resource_id,'locale':x.locale,'key':x.key,'mode':'base','saved':True}
+        if not resource_type.startswith('Product/') or x.owner_id!=x.resource_id:
+            raise HTTPException(400,'El recurso de contenido base debe ser el producto de esa tienda')
+        fields={'title':('title',None),'body_html':('descriptionHtml',None),'handle':('handle',None),'vendor':('vendor',None),'product_type':('productType',None),'seo_title':('seo.title','title'),'seo_description':('seo.description','description')}
+        if x.key not in fields: raise HTTPException(400,'El campo no está habilitado para actualizar el contenido base')
+        field,seo_field=fields[x.key]
+        product={'id':x.resource_id}
+        if seo_field: product['seo']={seo_field:x.value}
+        else: product[field]=x.value
+        mutation='''mutation UpdateBaseProduct($product:ProductUpdateInput!) { productUpdate(product:$product) { userErrors { field message } } }'''
+        result=shopify_graphql(store['domain'],store['token'],mutation,{'product':product}).get('productUpdate') or {}
+        errors=result.get('userErrors',[])
+        if errors: raise HTTPException(400,'Shopify: '+'; '.join(error.get('message','error') for error in errors)[:500])
+        return {'store':x.store,'resource_id':x.resource_id,'locale':x.locale,'key':x.key,'mode':'base','saved':True}
     if resource_type.startswith('Metafield/'):
         if x.key!='value': raise HTTPException(400,'La clave del metacampo no es válida')
     elif resource_type.startswith(('Product/','ProductVariant/')):
@@ -467,7 +528,7 @@ def save_shopify_translation(x:CellTranslation,user=Depends(operator)):
     result=shopify_graphql(store['domain'],store['token'],mutation,{'id':x.resource_id,'translations':[{'locale':x.locale,'key':x.key,'value':x.value,'translatableContentDigest':digest}]}).get('translationsRegister') or {}
     errors=result.get('userErrors',[])
     if errors: raise HTTPException(400,'Shopify: '+'; '.join(error.get('message','error') for error in errors)[:500])
-    return {'store':x.store,'resource_id':x.resource_id,'locale':x.locale,'key':x.key,'saved':True}
+    return {'store':x.store,'resource_id':x.resource_id,'locale':x.locale,'key':x.key,'mode':'translation','saved':True}
 
 @app.put('/api/stores')
 def save_store(x:StoreConfig):
