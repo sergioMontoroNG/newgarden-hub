@@ -29,6 +29,12 @@ class ImportProduct(BaseModel):
     mappings:dict[str,dict]=Field(default_factory=dict)
 class Enqueue(BaseModel): product_key:str; destinations:list[str]
 class Fields(BaseModel): fields:list[str]
+class CellTranslation(BaseModel):
+    store:str=Field(pattern=r'^[A-Z0-9_-]{2,12}$')
+    resource_id:str=Field(min_length=8,max_length=255)
+    locale:str=Field(min_length=2,max_length=20)
+    key:str=Field(min_length=1,max_length=255)
+    value:str=Field(max_length=200000)
 class StoreConfig(BaseModel):
     code:str=Field(pattern=r'^[A-Z0-9_-]{2,12}$')
     domain:str=Field(min_length=3,max_length=255)
@@ -38,6 +44,7 @@ class StoreConfig(BaseModel):
 STYLE='''<style>
 :root{color-scheme:light;--ink:#20332b;--muted:#68776f;--paper:#f5f3e9;--card:#fffef9;--green:#255b45;--lime:#c9df86;--line:#dce2d4;--orange:#c86b3c}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}header{background:var(--green);color:#fff;padding:22px max(24px,calc((100% - 1120px)/2));display:flex;justify-content:space-between;align-items:center;gap:20px}header strong{font-size:20px;letter-spacing:-.04em}nav{display:flex;gap:8px}nav a{color:#e5f0dc;text-decoration:none;padding:8px 12px;border-radius:999px}nav a:hover,nav a.active{background:#ffffff22;color:white}.wrap{max-width:1120px;margin:42px auto;padding:0 24px}h1{font-size:clamp(30px,5vw,48px);line-height:1.05;letter-spacing:-.055em;margin:0 0 10px}.lede{color:var(--muted);margin:0 0 28px}.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:24px;box-shadow:0 8px 24px #20332b08;margin:18px 0}.candidate{padding:14px 0;border-top:1px solid var(--line)}.candidate .button{margin-top:4px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}label{display:block;font-size:13px;font-weight:650;margin:0 0 6px}input,select{width:100%;padding:11px 12px;border:1px solid #ccd6c8;border-radius:10px;background:white;color:var(--ink);font:inherit}input:focus{outline:3px solid #c9df8677;border-color:var(--green)}.field{margin:12px 0}button,.button{border:0;background:var(--green);color:white;padding:11px 16px;border-radius:999px;font-family:inherit;font-size:14px;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block}button:hover,.button:hover{background:#194431}.secondary{background:#e8eee2;color:var(--green)}.actions{display:flex;gap:10px;align-items:center;margin-top:18px}.muted{color:var(--muted);font-size:13px}.badge{display:inline-block;padding:4px 9px;border-radius:999px;background:#edf2e6;color:var(--green);font-size:12px}.comparison-scroll{overflow:auto;max-height:75vh;border:1px solid var(--line);border-radius:12px}table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid var(--line);padding:11px 9px;vertical-align:top}.comparison-scroll table{width:max-content;min-width:100%;table-layout:auto;border-collapse:separate;border-spacing:0}.comparison-scroll th,.comparison-scroll td{text-align:left;border-bottom:1px solid var(--line);border-right:1px solid #edf0e8;padding:14px 16px;vertical-align:top;overflow-wrap:anywhere;background:var(--card)}.comparison-scroll thead th{position:sticky;top:0;background:#edf2e6;z-index:2}.comparison-scroll th:first-child,.comparison-scroll td:first-child{position:sticky;left:0;width:210px;min-width:210px;max-width:210px;background:#f7f8f2;z-index:1}.comparison-scroll thead th:first-child{z-index:3;background:#e5ecdc}.comparison-scroll td:not(:first-child),.comparison-scroll th:not(:first-child){width:290px;min-width:290px;max-width:360px}.comparison-scroll td details{margin-top:8px}.comparison-scroll td summary{color:var(--green);font-weight:650;cursor:pointer}.comparison-scroll td button.more{padding:4px 10px;font-size:12px;margin-top:6px}th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}code{background:#edf0e8;padding:2px 5px;border-radius:4px}.status{margin-left:8px;color:var(--green)}@media(max-width:600px){header{align-items:flex-start;flex-direction:column}.wrap{margin-top:28px;padding:0 16px}.card{padding:18px;overflow:auto}}
 </style>'''
+STYLE=STYLE.replace('</style>','''.cell-edit{width:100%;padding:0;border:0;border-radius:6px;background:transparent;color:inherit;text-align:left;white-space:normal;font:inherit}.cell-edit:hover{background:#edf2e6;color:var(--ink)}.cell-excerpt{display:block}.cell-rest{white-space:pre-wrap}.edit-dialog{width:min(760px,calc(100vw - 32px));border:1px solid var(--line);border-radius:16px;padding:24px;background:var(--card);color:var(--ink);box-shadow:0 20px 80px #14271f55}.edit-dialog::backdrop{background:#14271f88}.edit-dialog textarea{width:100%;min-height:260px;padding:12px;border:1px solid #ccd6c8;border-radius:10px;font:14px/1.5 ui-monospace,monospace}.edit-dialog .html-note{display:none}.edit-dialog.html-mode .html-note{display:block}</style>''')
 
 SHOPIFY_API_VERSION=os.getenv('SHOPIFY_API_VERSION','2026-07')
 
@@ -107,6 +114,7 @@ def shopify_product(store, gid, locales):
         data['translation_error']=translation_error
         data['translations_by_locale']={locale:data.pop(f't{n}',[]) for n,locale in enumerate(locales)}
         def mf_selection():
+            if translation_error: return ''
             return ' '.join(f'mt{n}:translations(locale:{json.dumps(locale)}) {{ key value outdated }}' for n,locale in enumerate(locales))
         def collect_connection(owner_id, field, initial):
             nodes=list(initial.get('nodes',[])); page=initial.get('pageInfo',{})
@@ -209,17 +217,27 @@ def product_browser(q:str='',source_id:str=''):
             rows=[]
             for f in data['fields']:
                 cells=[]
-                for value in f['values']:
+                for column_index,value in enumerate(f['values']):
                     if value is None or value=='': shown='<span class="muted">—</span>'
                     else:
                         raw=', '.join(map(str,value)) if isinstance(value,list) else str(value)
-                        if f['key']=='descriptionHtml': raw=html.unescape(re.sub(r'<[^>]*>',' ',raw)).strip()
-                        safe=esc(raw)
-                        shown=safe if len(raw)<=220 else f'{esc(raw[:220])}… <details><summary>Ver más</summary><div>{safe}</div></details>'
+                        display=html.unescape(re.sub(r'<[^>]*>',' ',raw)).strip() if f['key']=='descriptionHtml' else raw
+                        safe=esc(display)
+                        shown=safe if len(display)<=220 else f'<span>{esc(display[:220])}…</span><button type="button" class="more" data-full="{esc(display)}">Ver más</button>'
+                    edit=f.get('edits',[None]*len(f['values']))[column_index]
+                    if edit:
+                        encoded=esc(json.dumps(edit,ensure_ascii=False))
+                        shown=f'<span class="cell-display">{shown}</span><button type="button" class="cell-edit" data-edit="{encoded}">Editar celda</button>'
                     cells.append(f'<td>{shown}</td>')
                 rows.append(f'<tr><th>{esc(f["label"])}<br><code>{esc(f["key"])}</code></th>{"".join(cells)}</tr>')
             notices=''.join(f'<p class="muted">{esc(n)}</p>' for n in data['notices'])
-            detail=f'''<section class="card"><h2>Comparación del producto</h2><p class="lede">Campos actuales en cada tienda. Los textos largos se pueden desplegar con “Ver más”.</p><h3>{esc(data['source']['title'])}</h3><p class="muted">SKU: {esc(data['source']['sku'] or '—')} · {esc(data['source']['id'])}</p>{notices}<div class="comparison-scroll"><table><thead><tr><th>Campo</th>{cols}</tr></thead><tbody>{''.join(rows)}</tbody></table></div></section>'''
+            detail=f'''<section class="card"><h2>Comparación del producto</h2><p class="lede">Selecciona “Editar celda” para guardar una traducción en esa tienda y ese idioma. En descripciones, el editor conserva el HTML.</p><h3>{esc(data['source']['title'])}</h3><p class="muted">SKU: {esc(data['source']['sku'] or '—')} · {esc(data['source']['id'])}</p>{notices}<div class="comparison-scroll"><table><thead><tr><th>Campo</th>{cols}</tr></thead><tbody>{''.join(rows)}</tbody></table></div><dialog class="edit-dialog" id="cell-editor"><form method="dialog" id="cell-edit-form"><h2>Editar traducción</h2><p id="edit-context" class="muted"></p><p class="html-note muted">La descripción se guarda como HTML. Puedes editar etiquetas como &lt;p&gt;, &lt;ul&gt; y &lt;strong&gt;.</p><textarea id="edit-value" aria-label="Traducción"></textarea><div class="actions"><button type="submit" id="save-cell">Guardar en Shopify</button><button type="button" class="secondary" id="cancel-cell">Cancelar</button><span id="edit-status" class="status" role="status"></span></div></form></dialog></section><script>
+const editor=document.querySelector('#cell-editor'),form=document.querySelector('#cell-edit-form'),area=document.querySelector('#edit-value');let editTarget=null;
+document.querySelectorAll('.cell-edit').forEach(button=>button.addEventListener('click',()=>{{editTarget=JSON.parse(button.dataset.edit);area.value=editTarget.value||'';document.querySelector('#edit-context').textContent=editTarget.store+' · '+editTarget.locale+' · '+editTarget.key;editor.classList.toggle('html-mode',editTarget.key==='body_html');document.querySelector('#edit-status').textContent='';editor.showModal()}}));
+document.querySelectorAll('.more').forEach(button=>button.addEventListener('click',()=>{{button.previousElementSibling.textContent=button.dataset.full;button.remove()}}));
+document.querySelector('#cancel-cell').addEventListener('click',()=>editor.close());
+form.addEventListener('submit',async event=>{{event.preventDefault();if(!editTarget)return;const save=document.querySelector('#save-cell'),status=document.querySelector('#edit-status');save.disabled=true;status.textContent='Guardando…';const response=await fetch('/api/shopify/translations',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{...editTarget,value:area.value}})}});const result=await response.json();save.disabled=false;if(response.ok){{status.textContent='Guardado';location.reload()}}else status.textContent=result.detail||'No se pudo guardar'}});
+</script>'''
         except HTTPException as exc:
             detail=f'<section class="card"><h2>No se pudo cargar la comparación</h2><p>{html.escape(str(exc.detail))}</p></section>'
     if term:
@@ -358,53 +376,91 @@ def compare_shopify_product(source_id:str):
     fields=[]
     for key,val in source_base.items():
         values=[val]
+        edits=[None]
         for target in targets:
             product=target['product']; tr=translations(product,target['lookup_locale'])
             value=tr.get(keymap[key],'')
             if not value and target.get('uses_base_fields'): value=product_field_value(product,key)
             values.append(value)
-        fields.append({'key':key,'label':key.replace('.',' / '),'values':values})
+            editable={'title','body_html','handle','seo_title','seo_description','vendor','product_type'}
+            edits.append({'store':target['store'],'resource_id':product['id'],'locale':target['lookup_locale'],'key':keymap[key],'value':value} if product and keymap.get(key) in editable else None)
+        fields.append({'key':key,'label':key.replace('.',' / '),'values':values,'edits':edits})
     # Rows are defined by the Spanish source. A missing key and an empty value
     # are shown distinctly in every destination.
+    def is_yotpo(mf):
+        return 'yotpo' in str(mf.get('namespace','')).casefold() or 'yotpo' in str(mf.get('key','')).casefold()
+    def mf_value_raw(mf, locale=None):
+        if mf is None: return None
+        localized=next((item for item in mf.get('translations_by_locale',{}).get(locale,[]) if item.get('key')=='value'),None) if locale else None
+        return localized.get('value') if localized else mf.get('value')
     def mf_value(mf, product=None, locale=None):
         if mf is None: return 'Falta el metacampo'
-        translations_by_locale=mf.get('translations_by_locale',{})
-        translated=next((item.get('value') for item in translations_by_locale.get(locale,[]) if item.get('key')==mf.get('key')),None) if locale else None
-        value=translated if translated is not None else mf.get('value')
+        value=mf_value_raw(mf,locale)
         return value if value not in (None,'') else 'Metacampo vacío'
-    source_mfs=source.get('metafields',{}).get('nodes',[])
+    source_mfs=[item for item in source.get('metafields',{}).get('nodes',[]) if not is_yotpo(item)]
     for mf in sorted(source_mfs,key=lambda item:(item.get('namespace',''),item.get('key',''))):
         namespace,mfkey=mf['namespace'],mf['key']
         key=f'metafield.product.{namespace}.{mfkey}'
         values=[mf_value(mf)]
+        edits=[None]
         for target in targets:
             if not target['product']:
                 values.append('')
+                edits.append(None)
                 continue
-            dest=next((item for item in (target['product'] or {}).get('metafields',{}).get('nodes',[]) if item['namespace']==namespace and item['key']==mfkey),None)
+            dest=next((item for item in (target['product'] or {}).get('metafields',{}).get('nodes',[]) if item['namespace']==namespace and item['key']==mfkey and not is_yotpo(item)),None)
             values.append(mf_value(dest,target['product'],target['lookup_locale']))
-        fields.append({'key':key,'label':f'Producto · {namespace} / {mfkey} ({mf.get("type","")})','values':values})
+            value=mf_value_raw(dest,target['lookup_locale']) if dest else ''
+            edits.append({'store':target['store'],'resource_id':dest['id'],'locale':target['lookup_locale'],'key':'value','value':value} if dest and dest.get('type') in {'single_line_text_field','multi_line_text_field','rich_text_field','html'} else None)
+        fields.append({'key':key,'label':f'Producto · {namespace} / {mfkey} ({mf.get("type","")})','values':values,'edits':edits})
     for source_variant in source_variants:
-        variant_mfs=source_variant.get('metafields',{}).get('nodes',[])
+        variant_mfs=[item for item in source_variant.get('metafields',{}).get('nodes',[]) if not is_yotpo(item)]
         identity=source_variant.get('sku') or source_variant.get('title') or source_variant['id']
         identity_label=f'SKU {source_variant["sku"]}' if source_variant.get('sku') else source_variant.get('title') or source_variant['id']
         for mf in sorted(variant_mfs,key=lambda item:(item.get('namespace',''),item.get('key',''))):
             namespace,mfkey=mf['namespace'],mf['key']
             key=f'metafield.variant.{identity}.{namespace}.{mfkey}'
             values=[mf_value(mf)]
+            edits=[None]
             for target in targets:
                 if not target['product']:
                     values.append('')
+                    edits.append(None)
                     continue
                 dest_variant=next((v for v in (target['product'] or {}).get('variants',{}).get('nodes',[]) if (v.get('sku') or v.get('title') or v['id'])==identity),None)
-                dest_mf=next((item for item in (dest_variant or {}).get('metafields',{}).get('nodes',[]) if item['namespace']==namespace and item['key']==mfkey),None)
+                dest_mf=next((item for item in (dest_variant or {}).get('metafields',{}).get('nodes',[]) if item['namespace']==namespace and item['key']==mfkey and not is_yotpo(item)),None)
                 values.append(mf_value(dest_mf,target['product'],target['lookup_locale']))
-            fields.append({'key':key,'label':f'Variante · {identity_label} · {namespace} / {mfkey} ({mf.get("type","")})','values':values})
+                value=mf_value_raw(dest_mf,target['lookup_locale']) if dest_mf else ''
+                edits.append({'store':target['store'],'resource_id':dest_mf['id'],'locale':target['lookup_locale'],'key':'value','value':value} if dest_mf and dest_mf.get('type') in {'single_line_text_field','multi_line_text_field','rich_text_field','html'} else None)
+            fields.append({'key':key,'label':f'Variante · {identity_label} · {namespace} / {mfkey} ({mf.get("type","")})','values':values,'edits':edits})
     columns=[{'label':'ES · español (base)'}]+[{'label':t['label']} for t in targets]
     if not sku: notices.append('El producto de ES no tiene SKU; no se pudo proponer una correspondencia automática en otras tiendas.')
     for t in targets:
         if not t['product']: notices.append(f'{t["store"]} · {t["locale"]}: no hay producto equivalente localizado por correspondencia o SKU.')
     return {'source':{'id':source['id'],'title':source['title'],'sku':sku},'columns':columns,'fields':fields,'notices':list(dict.fromkeys(notices))}
+
+@app.post('/api/shopify/translations')
+def save_shopify_translation(x:CellTranslation,user=Depends(operator)):
+    store=next((item for item in shopify_stores() if item['code']==x.store),None)
+    if not store or not store['token']: raise HTTPException(404,'Tienda sin configurar')
+    allowed_locales={shopify_locale_code(locale,store['code']) for locale in store['locales']}
+    if x.locale not in allowed_locales: raise HTTPException(400,'El idioma no está configurado en esa tienda')
+    resource_type=x.resource_id.removeprefix('gid://shopify/')
+    if resource_type.startswith('Metafield/'):
+        if x.key!='value': raise HTTPException(400,'La clave del metacampo no es válida')
+    elif resource_type.startswith(('Product/','ProductVariant/')):
+        if x.key not in {'title','body_html','handle','seo_title','seo_description','vendor','product_type'}:
+            raise HTTPException(400,'El campo no está habilitado para traducción')
+    else: raise HTTPException(400,'Tipo de recurso Shopify no admitido')
+    resource_query='''query TranslationDigest($id:ID!) { translatableResource(resourceId:$id) { resourceId translatableContent { key value digest } } }'''
+    resource=shopify_graphql(store['domain'],store['token'],resource_query,{'id':x.resource_id}).get('translatableResource')
+    digest=next((item.get('digest') for item in (resource or {}).get('translatableContent',[]) if item.get('key')==x.key),None)
+    if not digest: raise HTTPException(409,'Shopify no ofrece un digest traducible para ese campo; comprueba el tipo de metacampo y los permisos')
+    mutation='''mutation RegisterTranslation($id:ID!,$translations:[TranslationInput!]!) { translationsRegister(resourceId:$id,translations:$translations) { userErrors { field message } translations { key value locale } } }'''
+    result=shopify_graphql(store['domain'],store['token'],mutation,{'id':x.resource_id,'translations':[{'locale':x.locale,'key':x.key,'value':x.value,'translatableContentDigest':digest}]}).get('translationsRegister') or {}
+    errors=result.get('userErrors',[])
+    if errors: raise HTTPException(400,'Shopify: '+'; '.join(error.get('message','error') for error in errors)[:500])
+    return {'store':x.store,'resource_id':x.resource_id,'locale':x.locale,'key':x.key,'saved':True}
 
 @app.put('/api/stores')
 def save_store(x:StoreConfig):
