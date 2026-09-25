@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "required": ["product_key", "target", "title", "description_html", "seo_title", "seo_description", "suggested_handle", "image_alts", "metafields", "warnings"],
+  "properties": {
+    "product_key": {"type":"string"}, "target":{"type":"string"},
+    "title":{"type":"string"}, "description_html":{"type":"string"},
+    "seo_title":{"type":"string"}, "seo_description":{"type":"string"},
+    "suggested_handle":{"type":"string"}, "image_alts":{"type":"array","items":{"type":"string"}},
+    "metafields":{"type":"object","properties":{},"additionalProperties":false}, "warnings":{"type":"array","items":{"type":"string"}}
+  }, "additionalProperties": false
+}
