@@ -53,7 +53,7 @@ def shopify_graphql(domain, token, query, variables=None):
     if data.get('errors'): raise HTTPException(502,'Shopify GraphQL: '+str(data['errors'][0].get('message','error'))[:250])
     return data.get('data',{})
 
-PRODUCT_SELECTION='''id title descriptionHtml handle vendor productType status tags createdAt updatedAt seo { title description } featuredMedia { preview { image { url altText } } } images(first:50) { nodes { id url altText } } variants(first:100) { nodes { id title sku barcode } } metafields(first:100) { nodes { id namespace key type value description } }'''
+PRODUCT_SELECTION='''id title descriptionHtml handle vendor productType status tags createdAt updatedAt seo { title description } featuredMedia { preview { image { url altText } } } images(first:50) { nodes { id url altText } } variants(first:100) { nodes { id title sku barcode } pageInfo { hasNextPage endCursor } } metafields(first:100) { nodes { id namespace key type value description } pageInfo { hasNextPage endCursor } }'''
 
 def shopify_stores():
     with pool.connection() as c:
@@ -106,8 +106,33 @@ def shopify_product(store, gid, locales):
     if data:
         data['translation_error']=translation_error
         data['translations_by_locale']={locale:data.pop(f't{n}',[]) for n,locale in enumerate(locales)}
+        def mf_selection():
+            return ' '.join(f'mt{n}:translations(locale:{json.dumps(locale)}) {{ key value outdated }}' for n,locale in enumerate(locales))
+        def collect_connection(owner_id, field, initial):
+            nodes=list(initial.get('nodes',[])); page=initial.get('pageInfo',{})
+            while page.get('hasNextPage'):
+                query=f'''query MetafieldPage($id:ID!,$after:String) {{ node(id:$id) {{ ... on {"Product" if field=="metafields" and owner_id==gid else "ProductVariant"} {{ {field}(first:100,after:$after) {{ nodes {{ id namespace key type value description {mf_selection()} }} pageInfo {{ hasNextPage endCursor }} }} }} }} }}'''
+                owner=shopify_graphql(store['domain'],store['token'],query,{'id':owner_id,'after':page.get('endCursor')}).get('node') or {}
+                connection=owner.get(field,{})
+                nodes.extend(connection.get('nodes',[])); page=connection.get('pageInfo',{})
+                if not page.get('endCursor') and page.get('hasNextPage'): raise HTTPException(502,'Shopify no devolvió el cursor de metacampos')
+            return nodes
+        data['metafields']['nodes']=collect_connection(gid,'metafields',data.get('metafields',{}))
+        variants=data.get('variants',{}).get('nodes',[])
+        variant_page=data.get('variants',{}).get('pageInfo',{})
+        while variant_page.get('hasNextPage'):
+            page_query='''query VariantPage($id:ID!,$after:String) { product(id:$id) { variants(first:100,after:$after) { nodes { id title sku barcode } pageInfo { hasNextPage endCursor } } } }'''
+            page_data=shopify_graphql(store['domain'],store['token'],page_query,{'id':gid,'after':variant_page.get('endCursor')}).get('product') or {}
+            connection=page_data.get('variants',{}); variants.extend(connection.get('nodes',[])); variant_page=connection.get('pageInfo',{})
+            if not variant_page.get('endCursor') and variant_page.get('hasNextPage'): raise HTTPException(502,'Shopify no devolvió el cursor de variantes')
+        data['variants']['nodes']=variants
+        for variant in variants:
+            variant['metafields']={'nodes':collect_connection(variant['id'],'metafields',{'nodes':[],'pageInfo':{'hasNextPage':True,'endCursor':None}})}
         for mf in data.get('metafields',{}).get('nodes',[]):
             mf['translations_by_locale']={locale:mf.pop(f'mt{n}',[]) for n,locale in enumerate(locales)}
+        for variant in variants:
+            for mf in variant.get('metafields',{}).get('nodes',[]):
+                mf['translations_by_locale']={locale:mf.pop(f'mt{n}',[]) for n,locale in enumerate(locales)}
     return data
 
 def shopify_locale_code(locale, store_code=''):
@@ -339,24 +364,42 @@ def compare_shopify_product(source_id:str):
             if not value and target.get('uses_base_fields'): value=product_field_value(product,key)
             values.append(value)
         fields.append({'key':key,'label':key.replace('.',' / '),'values':values})
-    # Include source and destination metafields, with blank cells where a value/translation is absent.
-    def is_yotpo(mf):
-        return 'yotpo' in str(mf.get('namespace','')).casefold() or 'yotpo' in str(mf.get('key','')).casefold()
-    source_mfs=[mf for mf in source.get('metafields',{}).get('nodes',[]) if not is_yotpo(mf)]
-    mf_keys={(mf['namespace'],mf['key']) for mf in source_mfs}
-    for target in targets:
-        mf_keys.update((mf['namespace'],mf['key']) for mf in (target['product'] or {}).get('metafields',{}).get('nodes',[]) if not is_yotpo(mf))
-    for namespace,mfkey in sorted(mf_keys):
-        mf=next((m for m in source_mfs if m['namespace']==namespace and m['key']==mfkey),None)
-        key=f'metafield.{namespace}.{mfkey}'; values=[mf.get('value','') if mf else '']
+    # Rows are defined by the Spanish source. A missing key and an empty value
+    # are shown distinctly in every destination.
+    def mf_value(mf, product=None, locale=None):
+        if mf is None: return 'Falta el metacampo'
+        translations_by_locale=mf.get('translations_by_locale',{})
+        translated=next((item.get('value') for item in translations_by_locale.get(locale,[]) if item.get('key')==mf.get('key')),None) if locale else None
+        value=translated if translated is not None else mf.get('value')
+        return value if value not in (None,'') else 'Metacampo vacío'
+    source_mfs=source.get('metafields',{}).get('nodes',[])
+    for mf in sorted(source_mfs,key=lambda item:(item.get('namespace',''),item.get('key',''))):
+        namespace,mfkey=mf['namespace'],mf['key']
+        key=f'metafield.product.{namespace}.{mfkey}'
+        values=[mf_value(mf)]
         for target in targets:
-            product=target['product']; dest_mf=next((m for m in (product or {}).get('metafields',{}).get('nodes',[]) if m['namespace']==namespace and m['key']==mfkey and not is_yotpo(m)),None)
-            tr=translations(product,target['lookup_locale']); mf_tr={x['key']:x.get('value','') for x in (dest_mf or {}).get('translations_by_locale',{}).get(target['lookup_locale'],[])}
-            value=mf_tr.get(key,tr.get(key,''))
-            if not value and target.get('uses_base_fields') and dest_mf: value=dest_mf.get('value','')
-            values.append(value)
-        mf_type=(mf or next((m for target in targets for m in (target['product'] or {}).get('metafields',{}).get('nodes',[]) if m['namespace']==namespace and m['key']==mfkey and not is_yotpo(m)),{})).get('type','')
-        fields.append({'key':key,'label':f'{namespace} / {mfkey} ({mf_type})','values':values})
+            if not target['product']:
+                values.append('')
+                continue
+            dest=next((item for item in (target['product'] or {}).get('metafields',{}).get('nodes',[]) if item['namespace']==namespace and item['key']==mfkey),None)
+            values.append(mf_value(dest,target['product'],target['lookup_locale']))
+        fields.append({'key':key,'label':f'Producto · {namespace} / {mfkey} ({mf.get("type","")})','values':values})
+    for source_variant in source_variants:
+        variant_mfs=source_variant.get('metafields',{}).get('nodes',[])
+        identity=source_variant.get('sku') or source_variant.get('title') or source_variant['id']
+        identity_label=f'SKU {source_variant["sku"]}' if source_variant.get('sku') else source_variant.get('title') or source_variant['id']
+        for mf in sorted(variant_mfs,key=lambda item:(item.get('namespace',''),item.get('key',''))):
+            namespace,mfkey=mf['namespace'],mf['key']
+            key=f'metafield.variant.{identity}.{namespace}.{mfkey}'
+            values=[mf_value(mf)]
+            for target in targets:
+                if not target['product']:
+                    values.append('')
+                    continue
+                dest_variant=next((v for v in (target['product'] or {}).get('variants',{}).get('nodes',[]) if (v.get('sku') or v.get('title') or v['id'])==identity),None)
+                dest_mf=next((item for item in (dest_variant or {}).get('metafields',{}).get('nodes',[]) if item['namespace']==namespace and item['key']==mfkey),None)
+                values.append(mf_value(dest_mf,target['product'],target['lookup_locale']))
+            fields.append({'key':key,'label':f'Variante · {identity_label} · {namespace} / {mfkey} ({mf.get("type","")})','values':values})
     columns=[{'label':'ES · español (base)'}]+[{'label':t['label']} for t in targets]
     if not sku: notices.append('El producto de ES no tiene SKU; no se pudo proponer una correspondencia automática en otras tiendas.')
     for t in targets:
