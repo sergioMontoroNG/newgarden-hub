@@ -1,0 +1,56 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, newgarden-vm]
+    timeout-minutes: 15
+    env:
+      DEPLOY_DIR: /home/sergioM/services/newgarden-content-hub
+    steps:
+      - name: Sync working copy to origin/main
+        run: |
+          set -euo pipefail
+          cd "$DEPLOY_DIR"
+          git fetch origin main
+          git reset --hard origin/main
+
+      - name: Build and restart services
+        run: |
+          set -euo pipefail
+          cd "$DEPLOY_DIR"
+          docker compose up -d --build
+
+      - name: Wait for health check
+        run: |
+          set -euo pipefail
+          cd "$DEPLOY_DIR"
+          PORT=$(grep -E '^HUB_PORT=' .env 2>/dev/null | cut -d= -f2)
+          BIND=$(grep -E '^HUB_BIND=' .env 2>/dev/null | cut -d= -f2)
+          PORT=${PORT:-8787}
+          BIND=${BIND:-127.0.0.1}
+          for i in $(seq 1 15); do
+            if curl -fsS "http://${BIND}:${PORT}/health" >/dev/null; then
+              echo "Service healthy on ${BIND}:${PORT}"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Health check failed after deploy" >&2
+          docker compose logs --since=5m app worker
+          exit 1
+
+      - name: Prune dangling images
+        if: always()
+        run: docker image prune -f
