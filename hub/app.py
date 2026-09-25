@@ -144,9 +144,8 @@ def shopify_product(store, gid, locales):
     return data
 
 def shopify_locale_code(locale, store_code=''):
-    region=locale.replace('_','-').split('-')[-1].upper()
-    if store_code=='NL' or region=='NL': return 'nl'
-    if store_code=='PT' or region=='PT': return 'pt-PT'
+    # Shopify requires the locale tag enabled on that exact shop. Never infer
+    # it from a country/store code (for example, es-MX may be es or es-419).
     return locale
 
 def product_field_value(product, key):
@@ -194,7 +193,7 @@ def stores_page():
     body='''<main class="wrap"><h1>Tiendas Shopify</h1><p class="lede">Configura las conexiones y los idiomas disponibles para cada tienda.</p><div id="stores" class="grid"><div class="card">Cargando tiendas…</div></div><section class="card"><h2>Añadir tienda</h2><form id="store-form"><div class="grid"><div class="field"><label for="code">Código</label><input id="code" placeholder="FR" pattern="[A-Z0-9_-]{2,12}" required></div><div class="field"><label for="domain">Dominio Shopify</label><input id="domain" placeholder="mi-tienda.myshopify.com" required></div><div class="field"><label for="token">Token de acceso Admin API</label><input id="token" type="password" autocomplete="new-password" placeholder="shpat_…"></div><div class="field"><label for="locales">Locales (separados por coma)</label><input id="locales" placeholder="fr-FR, en-GB"></div></div><div class="actions"><button>Guardar tienda</button><span id="message" class="status" role="status"></span></div></form><p class="muted">Los tokens se guardan en la base de datos de esta instancia. El token vacío conserva el actual al editar.</p></section></main>
 <script>
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-async function loadStores(){const r=await fetch('/api/stores');const data=await r.json();document.querySelector('#stores').innerHTML=data.map(s=>`<article class="card"><span class="badge">${s.active?'ACTIVA':'INACTIVA'}</span><h2>${esc(s.code)}</h2><p>${esc(s.domain||'Dominio sin configurar')}</p><p class="muted">Token: ${s.has_token?'•••••••• configurado':'sin configurar'} · Locales: ${esc(s.locales.join(', ')||'ninguno')}</p><button class="secondary" data-code="${esc(s.code)}">Editar configuración</button></article>`).join('')||'<div class="card">No hay tiendas configuradas.</div>';document.querySelectorAll('[data-code]').forEach(b=>b.addEventListener('click',()=>editStore(data.find(s=>s.code===b.dataset.code))))}
+async function loadStores(){const r=await fetch('/api/stores');const data=await r.json();document.querySelector('#stores').innerHTML=data.map(s=>`<article class="card"><span class="badge">${s.active?'ACTIVA':'INACTIVA'}</span><h2>${esc(s.code)}</h2><p>${esc(s.domain||'Dominio sin configurar')}</p><p class="muted">Token: ${s.has_token?'•••••••• configurado':'sin configurar'} · Locales configurados: ${esc(s.locales.join(', ')||'ninguno')}</p><button class="secondary" data-code="${esc(s.code)}">Editar configuración</button> <button class="secondary" data-fetch-locales="${esc(s.code)}" ${!s.active||!s.has_token?'disabled':''}>Consultar locales Shopify</button><div class="muted" id="shop-locales-${esc(s.code)}"></div></article>`).join('')||'<div class="card">No hay tiendas configuradas.</div>';document.querySelectorAll('[data-code]').forEach(b=>b.addEventListener('click',()=>editStore(data.find(s=>s.code===b.dataset.code))));document.querySelectorAll('[data-fetch-locales]').forEach(button=>button.addEventListener('click',async()=>{const s=data.find(item=>item.code===button.dataset.fetchLocales),panel=document.querySelector('#shop-locales-'+s.code);panel.textContent='Consultando Shopify…';const response=await fetch('/api/stores/'+encodeURIComponent(s.code)+'/shop-locales'),result=await response.json();if(!response.ok){panel.textContent=result.detail||'No se pudieron consultar los locales';return}const secondary=result.filter(item=>item.published&&!item.primary);panel.innerHTML='<p><strong>Locales habilitados en Shopify:</strong></p><ul>'+result.map(item=>`<li><code>${esc(item.locale)}</code> · ${esc(item.name)}${item.primary?' · principal':''}${item.published?' · publicado':' · no publicado'}</li>`).join('')+'</ul><button type="button" class="secondary use-shop-locales">Cargar secundarios publicados</button>';panel.querySelector('.use-shop-locales').addEventListener('click',()=>{editStore(s);document.querySelector('#locales').value=secondary.map(item=>item.locale).join(', ')})}))}
 function editStore(s){document.querySelector('#code').value=s.code;document.querySelector('#code').readOnly=true;document.querySelector('#domain').value=s.domain||'';document.querySelector('#token').value='';document.querySelector('#locales').value=s.locales.join(', ');window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'})}
 document.querySelector('#store-form').addEventListener('submit',async e=>{e.preventDefault();const payload={code:document.querySelector('#code').value.trim().toUpperCase(),domain:document.querySelector('#domain').value.trim(),token:document.querySelector('#token').value,locales:document.querySelector('#locales').value.split(',').map(x=>x.trim()).filter(Boolean)};const r=await fetch('/api/stores',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const m=document.querySelector('#message');if(r.ok){m.textContent='Configuración guardada';document.querySelector('#store-form').reset();document.querySelector('#code').readOnly=false;loadStores()}else{const x=await r.json();m.textContent=x.detail||'No se pudo guardar'}});loadStores();
 </script>'''
@@ -205,6 +204,14 @@ def list_stores():
     with pool.connection() as c:
         rows=c.execute("SELECT s.code,s.domain,s.active,COALESCE(s.config->>'admin_token','')<>'',COALESCE(array_agg(l.locale) FILTER (WHERE l.locale IS NOT NULL),'{}') FROM stores s LEFT JOIN store_locales l ON l.store_code=s.code GROUP BY s.code ORDER BY s.code").fetchall()
     return [{'code':r[0],'domain':r[1] or '', 'active':r[2], 'has_token':r[3], 'locales':r[4]} for r in rows]
+
+@app.get('/api/stores/{code}/shop-locales')
+def shop_locales(code:str):
+    store=next((item for item in shopify_stores() if item['code']==code),None)
+    if not store or not store['token']: raise HTTPException(404,'Tienda inactiva o sin credenciales Shopify')
+    query='''query EnabledShopLocales { shopLocales { locale name primary published } }'''
+    locales=shopify_graphql(store['domain'],store['token'],query).get('shopLocales',[])
+    return sorted(locales,key=lambda item:(not item.get('primary',False),item.get('locale','')))
 
 @app.get('/products',response_class=HTMLResponse)
 def product_browser(q:str='',source_id:str=''):
