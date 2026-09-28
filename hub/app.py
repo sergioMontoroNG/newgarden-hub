@@ -287,7 +287,7 @@ const editor=document.querySelector('#cell-editor'),form=document.querySelector(
 document.querySelectorAll('.cell-edit').forEach(button=>button.addEventListener('click',()=>{{editTarget=JSON.parse(button.dataset.edit);area.value=editTarget.value||'';document.querySelector('#edit-context').textContent=editTarget.store+' · '+editTarget.locale+' · '+editTarget.key+' · '+(editTarget.mode==='base'?'Contenido base':'Traducción');editor.classList.toggle('html-mode',editTarget.key==='body_html');document.querySelector('#edit-status').textContent='';document.querySelector('#translate-cell').disabled=editTarget.key==='handle'||editTarget.metafield_type==='rich_text_field'||!editTarget.source_value;editor.showModal()}}));
 document.querySelectorAll('.more').forEach(button=>button.addEventListener('click',()=>{{button.previousElementSibling.textContent=button.dataset.full;button.remove()}}));
 document.querySelector('#cancel-cell').addEventListener('click',()=>editor.close());
-document.querySelector('#translate-cell').addEventListener('click',async()=>{{if(!editTarget)return;const button=document.querySelector('#translate-cell'),status=document.querySelector('#edit-status');button.disabled=true;status.textContent='Traduciendo…';try{{const response=await fetch('/api/translate-cell',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{source_text:editTarget.source_value||'',source_store:'ES',source_locale:'es-ES',target_store:editTarget.store,target_locale:editTarget.locale,field_key:editTarget.key,metafield_type:editTarget.metafield_type,html:editTarget.key==='body_html'||editTarget.metafield_type==='html'}})}});const result=await response.json();if(!response.ok)throw new Error(result.detail||'Error de traducción');area.value=result.translation;status.textContent=result.memory_hit?'Texto recordado':(result.glossary_terms?`Traducción lista · ${result.glossary_terms} término(s) del glosario aplicado(s)`:'Traducción lista para revisar')}}catch(error){{status.textContent=error.message}}finally{{button.disabled=false}}}});
+document.querySelector('#translate-cell').addEventListener('click',async()=>{{if(!editTarget)return;const button=document.querySelector('#translate-cell'),status=document.querySelector('#edit-status');button.disabled=true;status.textContent='Traduciendo…';try{{const response=await fetch('/api/translate-cell',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{source_text:editTarget.source_value||'',source_store:'ES',source_locale:'es-ES',target_store:editTarget.store,target_locale:editTarget.locale,field_key:editTarget.key,metafield_type:editTarget.metafield_type,html:editTarget.key==='body_html'||editTarget.metafield_type==='html'}})}});const result=await response.json();if(!response.ok)throw new Error(result.detail||'Error de traducción');area.value=result.translation;status.textContent=result.memory_hit?'Texto recordado':(result.glossary_terms?`Traducción lista · ${{result.glossary_terms}} término(s) del glosario aplicado(s)`:'Traducción lista para revisar')}}catch(error){{status.textContent=error.message}}finally{{button.disabled=false}}}});
 form.addEventListener('submit',async event=>{{event.preventDefault();if(!editTarget)return;const save=document.querySelector('#save-cell'),status=document.querySelector('#edit-status');save.disabled=true;status.textContent='Guardando…';const response=await fetch('/api/shopify/translations',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{...editTarget,value:area.value}})}});const result=await response.json();save.disabled=false;if(response.ok){{status.textContent='Guardado';location.reload()}}else status.textContent=result.detail||'No se pudo guardar'}});
 </script>'''
         except HTTPException as exc:
@@ -537,16 +537,27 @@ def translate_cell(x:CellTranslateRequest,user=Depends(operator)):
     # Keep approved terms intact across DeepL without exposing a glossary or API key
     # to the browser. Replace only text nodes when the value contains HTML.
     import html as html_module
-    tokens={}; text=x.source_text
+    tokens={}; text=x.source_text; token_index=0
+    def preserve_term_case(source, target):
+        letters=''.join(char for char in source if char.isalpha())
+        if letters and letters.isupper(): return target.upper()
+        if letters and letters.islower(): return target.lower()
+        if letters and letters[0].isupper() and letters[1:].islower():
+            return target[:1].upper()+target[1:].lower()
+        return target
     segments=re.split(r'(<[^>]+>)',text) if x.html else [text]
     for i,segment in enumerate(segments):
         if segment.startswith('<') and segment.endswith('>'): continue
         for n,(source_term,target_term) in enumerate(terms):
-            marker=f'ZXQGLOSSARY{n:04d}QXZ'
             pattern=re.compile(re.escape(source_term),re.IGNORECASE)
-            if pattern.search(segment):
-                segment=pattern.sub(marker,segment)
-                tokens[marker]=html_module.escape(target_term) if x.html else target_term
+            def protect(match):
+                nonlocal token_index
+                marker=f'ZXQGLOSSARY{token_index:06d}QXZ'
+                token_index+=1
+                replacement=preserve_term_case(match.group(),target_term)
+                tokens[marker]=html_module.escape(replacement) if x.html else replacement
+                return marker
+            segment=pattern.sub(protect,segment)
         segments[i]=segment
     protected=''.join(segments)
     try:
