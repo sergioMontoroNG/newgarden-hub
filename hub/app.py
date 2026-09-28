@@ -433,6 +433,12 @@ def _compare_shopify_product(source_id:str,target_store:str|None=None,target_loc
     for store in stores:
         if store['code']=='ES': continue
         locales=list(store['locales'])
+        # MX needs its Spanish base column alongside configured secondary
+        # locales. Other stores keep only their configured locales in the
+        # comparison, even when their primary locale is Spanish.
+        primary=primary_locales.get(store['code'])
+        if store['code']=='MX' and primary and primary not in locales:
+            locales.insert(0,primary)
         locales.extend(locale for locale in (target_locales or {}).get(store['code'],[]) if locale not in locales)
         if store['code']==target_store and target_locale and target_locale not in locales:
             locales.append(target_locale)
