@@ -42,14 +42,18 @@ class CellTranslation(BaseModel):
     compare_digest:str|None=Field(default=None,max_length=255)
     source_value:str|None=Field(default=None,max_length=200000)
 class GlossaryTerm(BaseModel):
+    source_store:str=Field(min_length=2,max_length=12)
     source_locale:str=Field(default='es-ES',min_length=2,max_length=20)
+    target_store:str=Field(min_length=2,max_length=12)
     target_locale:str=Field(min_length=2,max_length=20)
     source_term:str=Field(min_length=1,max_length=500)
     target_term:str=Field(min_length=1,max_length=500)
     enabled:bool=True
 class CellTranslateRequest(BaseModel):
     source_text:str=Field(min_length=1,max_length=120000)
+    source_store:str=Field(default='ES',min_length=2,max_length=12)
     source_locale:str=Field(default='es-ES',min_length=2,max_length=20)
+    target_store:str=Field(min_length=2,max_length=12)
     target_locale:str=Field(min_length=2,max_length=20)
     html:bool=False
     field_key:str=Field(min_length=1,max_length=255)
@@ -228,8 +232,15 @@ document.querySelector('#store-form').addEventListener('submit',async e=>{e.prev
 
 @app.get('/glossary',response_class=HTMLResponse)
 def glossary_page():
-    body='''<main class="wrap"><h1>Glosario y aprendizaje</h1><p class="lede">Define términos preferidos por idioma. Las correcciones manuales se guardan como memoria exacta y se aplican cuando vuelve a aparecer el mismo texto.</p><section class="card"><h2>Añadir término</h2><form id="term-form"><div class="grid"><div class="field"><label>Idioma origen</label><input name="source_locale" value="es-ES" required></div><div class="field"><label>Idioma destino</label><input name="target_locale" placeholder="fr-FR" required></div><div class="field"><label>Término origen</label><input name="source_term" required></div><div class="field"><label>Traducción preferida</label><input name="target_term" required></div></div><button>Guardar término</button> <span id="term-status" class="status"></span></form></section><section class="card"><h2>Términos guardados</h2><div id="terms">Cargando…</div></section></main><script>
-const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));async function load(){const r=await fetch('/api/glossary');let d;try{d=await r.json()}catch{document.querySelector('#terms').textContent='La API devolvió una respuesta no válida';return}if(!r.ok){document.querySelector('#terms').textContent=d.detail||'No se pudo cargar el glosario';return}document.querySelector('#terms').innerHTML=d.terms.length?'<table><tr><th>Origen</th><th>Destino</th><th>Término</th><th>Traducción</th><th>Origen</th><th></th></tr>'+d.terms.map(t=>`<tr><td>${esc(t.source_locale)}</td><td>${esc(t.target_locale)}</td><td>${esc(t.source_term)}</td><td>${esc(t.target_term)}</td><td>${esc(t.origin)}</td><td><button class="secondary" onclick="removeTerm(${t.id})">Eliminar</button></td></tr>`).join('')+'</table>':'<p class="muted">Aún no hay términos.</p>'}async function removeTerm(id){await fetch('/api/glossary/'+id,{method:'DELETE'});load()}document.querySelector('#term-form').addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(e.target));const r=await fetch('/api/glossary',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});let result={};try{result=await r.json()}catch{}document.querySelector('#term-status').textContent=r.ok?'Guardado':(result.detail||'No se pudo guardar');if(r.ok){e.target.reset();e.target.elements.source_locale.value='es-ES';load()}});load();
+    body='''<main class="wrap"><h1>Glosario y aprendizaje</h1><p class="lede">Las reglas se limitan a una tienda origen, su locale y una tienda destino. El locale principal de Shopify queda seleccionado por defecto; puedes elegir otro locale publicado.</p><section class="card"><h2>Añadir término</h2><form id="term-form"><div class="grid"><div class="field"><label for="source-store">Tienda origen</label><select id="source-store" name="source_store" required></select></div><div class="field"><label for="source-locale">Idioma origen</label><select id="source-locale" name="source_locale" required disabled><option value="">Elige una tienda</option></select></div><div class="field"><label for="target-store">Tienda destino</label><select id="target-store" name="target_store" required></select></div><div class="field"><label for="target-locale">Idioma destino</label><select id="target-locale" name="target_locale" required disabled><option value="">Elige una tienda</option></select></div><div class="field"><label for="source-term">Término origen</label><input id="source-term" name="source_term" required></div><div class="field"><label for="target-term">Traducción preferida</label><input id="target-term" name="target_term" required></div></div><p id="locale-status" class="muted" role="status"></p><button id="save-term">Guardar término</button> <span id="term-status" class="status" role="status"></span></form></section><section class="card"><h2>Términos guardados</h2><div id="terms">Cargando…</div></section></main><script>
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));let stores=[];
+const sourceStore=document.querySelector('#source-store'),targetStore=document.querySelector('#target-store'),sourceLocale=document.querySelector('#source-locale'),targetLocale=document.querySelector('#target-locale'),localeStatus=document.querySelector('#locale-status');
+async function loadStores(){const r=await fetch('/api/stores'),data=await r.json();stores=data.filter(s=>s.active);const options=stores.map(s=>`<option value="${esc(s.code)}">${esc(s.code)} · ${esc(s.domain)}</option>`).join('');sourceStore.innerHTML=options;targetStore.innerHTML=options;await Promise.all([loadLocales(sourceStore.value,sourceLocale),loadLocales(targetStore.value,targetLocale)]);}
+async function loadLocales(code,select){select.disabled=true;select.innerHTML='<option value="">Consultando Shopify…</option>';try{const r=await fetch('/api/stores/'+encodeURIComponent(code)+'/shop-locales'),data=await r.json();if(!r.ok)throw new Error(data.detail||'Shopify no devolvió los idiomas');const shopLocales=data.filter(x=>x.published);const configured=stores.find(s=>s.code===code)?.locales||[];const choices=shopLocales.filter(x=>configured.includes(x.locale));if(!choices.length)throw new Error('No hay locales publicados y configurados a la vez. Configúralos en Tiendas.');select.innerHTML=choices.map(x=>`<option value="${esc(x.locale)}">${esc(x.locale)}${x.primary?' · principal':''}</option>`).join('');const primary=choices.find(x=>x.primary);select.value=(primary||choices[0]).locale;select.disabled=false;localeStatus.textContent='Locales publicados en Shopify; el principal está marcado y seleccionado por defecto.';return true}catch(error){select.innerHTML='<option value="">No se pudieron validar los locales</option>';select.disabled=true;localeStatus.textContent=error.message+' · Revisa la conexión y los permisos read_locales en Tiendas.';return false}}
+sourceStore.addEventListener('change',()=>loadLocales(sourceStore.value,sourceLocale));targetStore.addEventListener('change',()=>loadLocales(targetStore.value,targetLocale));
+async function loadTerms(){const r=await fetch('/api/glossary');let d;try{d=await r.json()}catch{document.querySelector('#terms').textContent='La API devolvió una respuesta no válida';return}if(!r.ok){document.querySelector('#terms').textContent=d.detail||'No se pudo cargar el glosario';return}document.querySelector('#terms').innerHTML=d.terms.length?'<table><tr><th>Tienda origen</th><th>Idioma</th><th>Tienda destino</th><th>Idioma</th><th>Término</th><th>Traducción</th><th></th></tr>'+d.terms.map(t=>`<tr><td>${esc(t.source_store||'Todas (regla antigua)')}</td><td>${esc(t.source_locale)}</td><td>${esc(t.target_store||'Todas (regla antigua)')}</td><td>${esc(t.target_locale)}</td><td>${esc(t.source_term)}</td><td>${esc(t.target_term)}</td><td><button class="secondary" onclick="removeTerm(${t.id})">Eliminar</button></td></tr>`).join('')+'</table>':'<p class="muted">Aún no hay términos.</p>'}
+async function removeTerm(id){const r=await fetch('/api/glossary/'+id,{method:'DELETE'});if(r.ok)loadTerms()}
+document.querySelector('#term-form').addEventListener('submit',async e=>{e.preventDefault();const save=document.querySelector('#save-term');save.disabled=true;const data=Object.fromEntries(new FormData(e.target));const r=await fetch('/api/glossary',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});let result={};try{result=await r.json()}catch{}document.querySelector('#term-status').textContent=r.ok?'Guardado':(result.detail||'No se pudo guardar');save.disabled=false;if(r.ok){document.querySelector('#source-term').value='';document.querySelector('#target-term').value='';loadTerms()}});loadStores();loadTerms();
 </script>'''
     return shell('Glosario',body,'glossary')
 
@@ -276,7 +287,7 @@ const editor=document.querySelector('#cell-editor'),form=document.querySelector(
 document.querySelectorAll('.cell-edit').forEach(button=>button.addEventListener('click',()=>{{editTarget=JSON.parse(button.dataset.edit);area.value=editTarget.value||'';document.querySelector('#edit-context').textContent=editTarget.store+' · '+editTarget.locale+' · '+editTarget.key+' · '+(editTarget.mode==='base'?'Contenido base':'Traducción');editor.classList.toggle('html-mode',editTarget.key==='body_html');document.querySelector('#edit-status').textContent='';document.querySelector('#translate-cell').disabled=editTarget.key==='handle'||editTarget.metafield_type==='rich_text_field'||!editTarget.source_value;editor.showModal()}}));
 document.querySelectorAll('.more').forEach(button=>button.addEventListener('click',()=>{{button.previousElementSibling.textContent=button.dataset.full;button.remove()}}));
 document.querySelector('#cancel-cell').addEventListener('click',()=>editor.close());
-document.querySelector('#translate-cell').addEventListener('click',async()=>{{if(!editTarget)return;const button=document.querySelector('#translate-cell'),status=document.querySelector('#edit-status');button.disabled=true;status.textContent='Traduciendo…';try{{const response=await fetch('/api/translate-cell',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{source_text:editTarget.source_value||'',source_locale:'es-ES',target_locale:editTarget.locale,field_key:editTarget.key,metafield_type:editTarget.metafield_type,html:editTarget.key==='body_html'||editTarget.metafield_type==='html'}})}});const result=await response.json();if(!response.ok)throw new Error(result.detail||'Error de traducción');area.value=result.translation;status.textContent=result.memory_hit?'Texto recordado':'Traducción lista para revisar'}}catch(error){{status.textContent=error.message}}finally{{button.disabled=false}}}});
+document.querySelector('#translate-cell').addEventListener('click',async()=>{{if(!editTarget)return;const button=document.querySelector('#translate-cell'),status=document.querySelector('#edit-status');button.disabled=true;status.textContent='Traduciendo…';try{{const response=await fetch('/api/translate-cell',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{source_text:editTarget.source_value||'',source_store:'ES',source_locale:'es-ES',target_store:editTarget.store,target_locale:editTarget.locale,field_key:editTarget.key,metafield_type:editTarget.metafield_type,html:editTarget.key==='body_html'||editTarget.metafield_type==='html'}})}});const result=await response.json();if(!response.ok)throw new Error(result.detail||'Error de traducción');area.value=result.translation;status.textContent=result.memory_hit?'Texto recordado':(result.glossary_terms?`Traducción lista · ${result.glossary_terms} término(s) del glosario aplicado(s)`:'Traducción lista para revisar')}}catch(error){{status.textContent=error.message}}finally{{button.disabled=false}}}});
 form.addEventListener('submit',async event=>{{event.preventDefault();if(!editTarget)return;const save=document.querySelector('#save-cell'),status=document.querySelector('#edit-status');save.disabled=true;status.textContent='Guardando…';const response=await fetch('/api/shopify/translations',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{...editTarget,value:area.value}})}});const result=await response.json();save.disabled=false;if(response.ok){{status.textContent='Guardado';location.reload()}}else status.textContent=result.detail||'No se pudo guardar'}});
 </script>'''
         except HTTPException as exc:
@@ -503,8 +514,25 @@ def translate_cell(x:CellTranslateRequest,user=Depends(operator)):
     if x.field_key=='handle' or x.metafield_type=='rich_text_field': raise HTTPException(400,'Este tipo de campo requiere adaptación manual antes de traducirse')
     if not os.getenv('DEEPL_AUTH_KEY','').strip(): raise HTTPException(503,'DeepL no está configurado en el servidor')
     with pool.connection() as c:
-        exact=c.execute("SELECT target_text FROM translation_memory WHERE source_locale=%s AND target_locale=%s AND source_text=%s",(x.source_locale,x.target_locale,x.source_text.strip())).fetchone()
-        terms=c.execute("SELECT source_term,target_term FROM translation_glossary WHERE source_locale=%s AND target_locale=%s AND enabled ORDER BY length(source_term) DESC",(x.source_locale,x.target_locale)).fetchall()
+        exact=c.execute("""SELECT target_text FROM translation_memory
+            WHERE split_part(lower(source_locale),'-',1)=split_part(lower(%s),'-',1)
+              AND split_part(lower(target_locale),'-',1)=split_part(lower(%s),'-',1)
+              AND source_text=%s
+            ORDER BY ((lower(source_locale)=lower(%s))::int + (lower(target_locale)=lower(%s))::int) DESC
+            LIMIT 1""",(x.source_locale,x.target_locale,x.source_text.strip(),x.source_locale,x.target_locale)).fetchone()
+        terms=c.execute("""SELECT source_term,target_term FROM (
+              SELECT DISTINCT ON (lower(source_term)) source_term,target_term,
+                (((source_store=%s AND target_store=%s)::int * 2)
+                  + (lower(source_locale)=lower(%s))::int
+                  + (lower(target_locale)=lower(%s))::int) AS specificity
+              FROM translation_glossary
+              WHERE enabled
+                AND ((source_store=%s AND target_store=%s) OR (source_store IS NULL AND target_store IS NULL))
+                AND split_part(lower(source_locale),'-',1)=split_part(lower(%s),'-',1)
+                AND split_part(lower(target_locale),'-',1)=split_part(lower(%s),'-',1)
+              ORDER BY lower(source_term),specificity DESC,updated_at DESC
+            ) preferred_terms ORDER BY length(source_term) DESC""",
+            (x.source_store,x.target_store,x.source_locale,x.target_locale,x.source_store,x.target_store,x.source_locale,x.target_locale)).fetchall()
     if exact: return {'translation':exact[0],'memory_hit':True}
     # Keep approved terms intact across DeepL without exposing a glossary or API key
     # to the browser. Replace only text nodes when the value contains HTML.
@@ -533,15 +561,24 @@ def translate_cell(x:CellTranslateRequest,user=Depends(operator)):
 def list_glossary(target_locale:str|None=None,user=Depends(operator)):
     with pool.connection() as c:
         if target_locale:
-            rows=c.execute("SELECT id,source_locale,target_locale,source_term,target_term,enabled,origin FROM translation_glossary WHERE target_locale=%s ORDER BY target_locale,source_term",(target_locale,)).fetchall()
+            rows=c.execute("SELECT id,source_store,source_locale,target_store,target_locale,source_term,target_term,enabled,origin FROM translation_glossary WHERE target_locale=%s ORDER BY source_store,target_store,source_term",(target_locale,)).fetchall()
         else:
-            rows=c.execute("SELECT id,source_locale,target_locale,source_term,target_term,enabled,origin FROM translation_glossary ORDER BY target_locale,source_term").fetchall()
-    return {'terms':[dict(zip(('id','source_locale','target_locale','source_term','target_term','enabled','origin'),r)) for r in rows]}
+            rows=c.execute("SELECT id,source_store,source_locale,target_store,target_locale,source_term,target_term,enabled,origin FROM translation_glossary ORDER BY source_store,target_store,target_locale,source_term").fetchall()
+    return {'terms':[dict(zip(('id','source_store','source_locale','target_store','target_locale','source_term','target_term','enabled','origin'),r)) for r in rows]}
 
 @app.post('/api/glossary')
 def add_glossary_term(x:GlossaryTerm,user=Depends(operator)):
+    active={item['code']:item for item in shopify_stores()}
+    if x.source_store not in active or x.target_store not in active: raise HTTPException(400,'Selecciona tiendas activas de la lista')
+    if x.source_locale not in active[x.source_store]['locales']: raise HTTPException(400,'El idioma origen no está configurado en la tienda origen')
+    if x.target_locale not in active[x.target_store]['locales']: raise HTTPException(400,'El idioma destino no está configurado en la tienda destino')
     with pool.connection() as c:
-        row=c.execute("INSERT INTO translation_glossary(source_locale,target_locale,source_term,target_term,enabled) VALUES(%s,%s,%s,%s,%s) ON CONFLICT(source_locale,target_locale,source_term) DO UPDATE SET target_term=EXCLUDED.target_term,enabled=EXCLUDED.enabled,updated_at=now() RETURNING id",(x.source_locale,x.target_locale,x.source_term,x.target_term,x.enabled)).fetchone()
+        row=c.execute("""INSERT INTO translation_glossary(source_store,source_locale,target_store,target_locale,source_term,target_term,enabled)
+          VALUES(%s,%s,%s,%s,%s,%s,%s)
+          ON CONFLICT (source_store,source_locale,target_store,target_locale,(lower(source_term)))
+          WHERE source_store IS NOT NULL AND target_store IS NOT NULL
+          DO UPDATE SET target_term=EXCLUDED.target_term,enabled=EXCLUDED.enabled,updated_at=now()
+          RETURNING id""",(x.source_store,x.source_locale,x.target_store,x.target_locale,x.source_term,x.target_term,x.enabled)).fetchone()
     return {'id':row[0],'saved':True}
 
 @app.delete('/api/glossary/{term_id}')

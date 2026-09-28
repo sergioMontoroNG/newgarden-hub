@@ -1,0 +1,1 @@
+ALTER TABLE translation_glossary DROP CONSTRAINT IF EXISTS translation_glossary_source_locale_target_locale_source_ter_key;
