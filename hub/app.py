@@ -40,6 +40,20 @@ class CellTranslation(BaseModel):
     metafield_key:str|None=Field(default=None,max_length=255)
     metafield_type:str|None=Field(default=None,max_length=100)
     compare_digest:str|None=Field(default=None,max_length=255)
+    source_value:str|None=Field(default=None,max_length=200000)
+class GlossaryTerm(BaseModel):
+    source_locale:str=Field(default='es-ES',min_length=2,max_length=20)
+    target_locale:str=Field(min_length=2,max_length=20)
+    source_term:str=Field(min_length=1,max_length=500)
+    target_term:str=Field(min_length=1,max_length=500)
+    enabled:bool=True
+class CellTranslateRequest(BaseModel):
+    source_text:str=Field(min_length=1,max_length=120000)
+    source_locale:str=Field(default='es-ES',min_length=2,max_length=20)
+    target_locale:str=Field(min_length=2,max_length=20)
+    html:bool=False
+    field_key:str=Field(min_length=1,max_length=255)
+    metafield_type:str|None=None
 class StoreConfig(BaseModel):
     code:str=Field(pattern=r'^[A-Z0-9_-]{2,12}$')
     domain:str=Field(min_length=3,max_length=255)
@@ -181,7 +195,7 @@ def product_field_value(product, key):
     return ''
 
 def shell(title, body, active=''):
-    links=''.join(f'<a class="{"active" if key==active else ""}" href="{url}">{label}</a>' for key,url,label in [('home','/','Resumen'),('products','/products','Productos'),('stores','/stores','Tiendas')])
+    links=''.join(f'<a class="{"active" if key==active else ""}" href="{url}">{label}</a>' for key,url,label in [('home','/','Resumen'),('products','/products','Productos'),('glossary','/glossary','Glosario'),('stores','/stores','Tiendas')])
     return f'''<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(title)} · Newgarden Hub</title>{STYLE}</head><body><header><strong>newgarden <span style="color:var(--lime)">/</span> content hub</strong><nav>{links}</nav></header>{body}</body></html>'''
 
 @app.get('/health')
@@ -211,6 +225,13 @@ function editStore(s){document.querySelector('#code').value=s.code;document.quer
 document.querySelector('#store-form').addEventListener('submit',async e=>{e.preventDefault();const payload={code:document.querySelector('#code').value.trim().toUpperCase(),domain:document.querySelector('#domain').value.trim(),token:document.querySelector('#token').value,locales:document.querySelector('#locales').value.split(',').map(x=>x.trim()).filter(Boolean)};const r=await fetch('/api/stores',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const m=document.querySelector('#message');if(r.ok){m.textContent='Configuración guardada';document.querySelector('#store-form').reset();document.querySelector('#code').readOnly=false;loadStores()}else{const x=await r.json();m.textContent=x.detail||'No se pudo guardar'}});loadStores();
 </script>'''
     return shell('Tiendas',body,'stores')
+
+@app.get('/glossary',response_class=HTMLResponse)
+def glossary_page():
+    body='''<main class="wrap"><h1>Glosario y aprendizaje</h1><p class="lede">Define términos preferidos por idioma. Las correcciones manuales se guardan como memoria exacta y se aplican cuando vuelve a aparecer el mismo texto.</p><section class="card"><h2>Añadir término</h2><form id="term-form"><div class="grid"><div class="field"><label>Idioma origen</label><input name="source_locale" value="es-ES" required></div><div class="field"><label>Idioma destino</label><input name="target_locale" placeholder="fr-FR" required></div><div class="field"><label>Término origen</label><input name="source_term" required></div><div class="field"><label>Traducción preferida</label><input name="target_term" required></div></div><button>Guardar término</button> <span id="term-status" class="status"></span></form></section><section class="card"><h2>Términos guardados</h2><div id="terms">Cargando…</div></section></main><script>
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));async function load(){const r=await fetch('/api/glossary'),d=await r.json();document.querySelector('#terms').innerHTML=d.terms.length?'<table><tr><th>Origen</th><th>Destino</th><th>Término</th><th>Traducción</th><th>Origen</th><th></th></tr>'+d.terms.map(t=>`<tr><td>${esc(t.source_locale)}</td><td>${esc(t.target_locale)}</td><td>${esc(t.source_term)}</td><td>${esc(t.target_term)}</td><td>${esc(t.origin)}</td><td><button class="secondary" onclick="removeTerm(${t.id})">Eliminar</button></td></tr>`).join('')+'</table>':'<p class="muted">Aún no hay términos.</p>'}async function removeTerm(id){await fetch('/api/glossary/'+id,{method:'DELETE'});load()}document.querySelector('#term-form').addEventListener('submit',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(e.target));const r=await fetch('/api/glossary',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});document.querySelector('#term-status').textContent=r.ok?'Guardado':'No se pudo guardar';if(r.ok){e.target.reset();e.target.elements.source_locale.value='es-ES';load()}});load();
+</script>'''
+    return shell('Glosario',body,'glossary')
 
 @app.get('/api/stores')
 def list_stores():
@@ -250,11 +271,12 @@ def product_browser(q:str='',source_id:str=''):
                     cells.append(f'<td>{shown}</td>')
                 rows.append(f'<tr><th>{esc(f["label"])}<br><code>{esc(f["key"])}</code></th>{"".join(cells)}</tr>')
             notices=''.join(f'<p class="muted">{esc(n)}</p>' for n in data['notices'])
-            detail=f'''<section class="card"><h2>Comparación del producto</h2><p class="lede">Los locales secundarios de NL y PT guardan traducciones. Las demás tiendas actualizan el contenido de su locale principal. En descripciones, el editor conserva el HTML.</p><h3>{esc(data['source']['title'])}</h3><p class="muted">SKU: {esc(data['source']['sku'] or '—')} · {esc(data['source']['id'])}</p>{notices}<div class="comparison-scroll"><table><thead><tr><th>Campo</th>{cols}</tr></thead><tbody>{''.join(rows)}</tbody></table></div><dialog class="edit-dialog" id="cell-editor"><form method="dialog" id="cell-edit-form"><h2>Editar contenido</h2><p id="edit-context" class="muted"></p><p class="html-note muted">La descripción se guarda como HTML. Puedes editar etiquetas como &lt;p&gt;, &lt;ul&gt; y &lt;strong&gt;.</p><textarea id="edit-value" aria-label="Contenido"></textarea><div class="actions"><button type="submit" id="save-cell">Guardar en Shopify</button><button type="button" class="secondary" id="cancel-cell">Cancelar</button><span id="edit-status" class="status" role="status"></span></div></form></dialog></section><script>
+            detail=f'''<section class="card"><h2>Comparación del producto</h2><p class="lede">Los locales secundarios de NL y PT guardan traducciones. Las demás tiendas actualizan el contenido de su locale principal. En descripciones, el editor conserva el HTML.</p><h3>{esc(data['source']['title'])}</h3><p class="muted">SKU: {esc(data['source']['sku'] or '—')} · {esc(data['source']['id'])}</p>{notices}<div class="comparison-scroll"><table><thead><tr><th>Campo</th>{cols}</tr></thead><tbody>{''.join(rows)}</tbody></table></div><dialog class="edit-dialog" id="cell-editor"><form method="dialog" id="cell-edit-form"><h2>Editar contenido</h2><p id="edit-context" class="muted"></p><p class="html-note muted">La descripción se guarda como HTML. Puedes editar etiquetas como &lt;p&gt;, &lt;ul&gt; y &lt;strong&gt;.</p><textarea id="edit-value" aria-label="Contenido"></textarea><div class="actions"><button type="button" class="secondary" id="translate-cell">Traducir con DeepL</button><button type="submit" id="save-cell">Guardar en Shopify</button><button type="button" class="secondary" id="cancel-cell">Cancelar</button><span id="edit-status" class="status" role="status"></span></div></form></dialog></section><script>
 const editor=document.querySelector('#cell-editor'),form=document.querySelector('#cell-edit-form'),area=document.querySelector('#edit-value');let editTarget=null;
-document.querySelectorAll('.cell-edit').forEach(button=>button.addEventListener('click',()=>{{editTarget=JSON.parse(button.dataset.edit);area.value=editTarget.value||'';document.querySelector('#edit-context').textContent=editTarget.store+' · '+editTarget.locale+' · '+editTarget.key+' · '+(editTarget.mode==='base'?'Contenido base':'Traducción');editor.classList.toggle('html-mode',editTarget.key==='body_html');document.querySelector('#edit-status').textContent='';editor.showModal()}}));
+document.querySelectorAll('.cell-edit').forEach(button=>button.addEventListener('click',()=>{{editTarget=JSON.parse(button.dataset.edit);area.value=editTarget.value||'';document.querySelector('#edit-context').textContent=editTarget.store+' · '+editTarget.locale+' · '+editTarget.key+' · '+(editTarget.mode==='base'?'Contenido base':'Traducción');editor.classList.toggle('html-mode',editTarget.key==='body_html');document.querySelector('#edit-status').textContent='';document.querySelector('#translate-cell').disabled=editTarget.key==='handle'||editTarget.metafield_type==='rich_text_field'||!editTarget.source_value;editor.showModal()}}));
 document.querySelectorAll('.more').forEach(button=>button.addEventListener('click',()=>{{button.previousElementSibling.textContent=button.dataset.full;button.remove()}}));
 document.querySelector('#cancel-cell').addEventListener('click',()=>editor.close());
+document.querySelector('#translate-cell').addEventListener('click',async()=>{{if(!editTarget)return;const button=document.querySelector('#translate-cell'),status=document.querySelector('#edit-status');button.disabled=true;status.textContent='Traduciendo…';try{{const response=await fetch('/api/translate-cell',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{source_text:editTarget.source_value||'',source_locale:'es-ES',target_locale:editTarget.locale,field_key:editTarget.key,metafield_type:editTarget.metafield_type,html:editTarget.key==='body_html'||editTarget.metafield_type==='html'}})}});const result=await response.json();if(!response.ok)throw new Error(result.detail||'Error de traducción');area.value=result.translation;status.textContent=result.memory_hit?'Texto recordado':'Traducción lista para revisar'}}catch(error){{status.textContent=error.message}}finally{{button.disabled=false}}}});
 form.addEventListener('submit',async event=>{{event.preventDefault();if(!editTarget)return;const save=document.querySelector('#save-cell'),status=document.querySelector('#edit-status');save.disabled=true;status.textContent='Guardando…';const response=await fetch('/api/shopify/translations',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{...editTarget,value:area.value}})}});const result=await response.json();save.disabled=false;if(response.ok){{status.textContent='Guardado';location.reload()}}else status.textContent=result.detail||'No se pudo guardar'}});
 </script>'''
         except HTTPException as exc:
@@ -413,7 +435,7 @@ def compare_shopify_product(source_id:str):
             if not value and target.get('uses_base_fields') and target['mode']=='translation': value=product_field_value(product,key)
             values.append(value)
             editable={'title','body_html','handle','seo_title','seo_description','vendor','product_type'}
-            edits.append({'store':target['store'],'resource_id':product['id'],'owner_id':product['id'],'locale':target['lookup_locale'],'key':keymap[key],'value':value,'mode':target['mode']} if product and target['mode']!='readonly' and keymap.get(key) in editable else None)
+            edits.append({'store':target['store'],'resource_id':product['id'],'owner_id':product['id'],'locale':target['lookup_locale'],'key':keymap[key],'value':value,'source_value':val,'mode':target['mode']} if product and target['mode']!='readonly' and keymap.get(key) in editable else None)
         fields.append({'key':key,'label':key.replace('.',' / '),'values':values,'edits':edits})
     # Rows are defined by the Spanish source. A missing key and an empty value
     # are shown distinctly in every destination.
@@ -441,7 +463,7 @@ def compare_shopify_product(source_id:str):
             dest=next((item for item in (target['product'] or {}).get('metafields',{}).get('nodes',[]) if item['namespace']==namespace and item['key']==mfkey and not is_yotpo(item)),None)
             raw_mf_value=mf_value_raw(dest,target['lookup_locale'] if target['mode']=='translation' else None) if dest else None
             values.append(mf_value(dest,target['product'],target['lookup_locale'] if target['mode']=='translation' else None))
-            edits.append({'store':target['store'],'resource_id':dest['id'],'owner_id':target['product']['id'],'locale':target['lookup_locale'],'key':'value','value':raw_mf_value,'namespace':namespace,'metafield_key':mfkey,'metafield_type':dest.get('type'),'compare_digest':dest.get('compareDigest'),'mode':target['mode']} if dest and target['mode']!='readonly' and dest.get('type') in {'single_line_text_field','multi_line_text_field','rich_text_field','html'} else None)
+            edits.append({'store':target['store'],'resource_id':dest['id'],'owner_id':target['product']['id'],'locale':target['lookup_locale'],'key':'value','value':raw_mf_value,'source_value':mf_value_raw(mf),'namespace':namespace,'metafield_key':mfkey,'metafield_type':dest.get('type'),'compare_digest':dest.get('compareDigest'),'mode':target['mode']} if dest and target['mode']!='readonly' and dest.get('type') in {'single_line_text_field','multi_line_text_field','rich_text_field','html'} else None)
         fields.append({'key':key,'label':f'Producto · {namespace} / {mfkey} ({mf.get("type","")})','values':values,'edits':edits})
     for source_variant in source_variants:
         variant_mfs=[item for item in source_variant.get('metafields',{}).get('nodes',[]) if not is_yotpo(item)]
@@ -461,13 +483,68 @@ def compare_shopify_product(source_id:str):
                 dest_mf=next((item for item in (dest_variant or {}).get('metafields',{}).get('nodes',[]) if item['namespace']==namespace and item['key']==mfkey and not is_yotpo(item)),None)
                 raw_mf_value=mf_value_raw(dest_mf,target['lookup_locale'] if target['mode']=='translation' else None) if dest_mf else None
                 values.append(mf_value(dest_mf,target['product'],target['lookup_locale'] if target['mode']=='translation' else None))
-                edits.append({'store':target['store'],'resource_id':dest_mf['id'],'owner_id':dest_variant['id'] if dest_variant else '', 'locale':target['lookup_locale'],'key':'value','value':raw_mf_value,'namespace':namespace,'metafield_key':mfkey,'metafield_type':dest_mf.get('type'),'compare_digest':dest_mf.get('compareDigest'),'mode':target['mode']} if dest_mf and target['mode']!='readonly' and dest_mf.get('type') in {'single_line_text_field','multi_line_text_field','rich_text_field','html'} else None)
+                edits.append({'store':target['store'],'resource_id':dest_mf['id'],'owner_id':dest_variant['id'] if dest_variant else '', 'locale':target['lookup_locale'],'key':'value','value':raw_mf_value,'source_value':mf_value_raw(mf),'namespace':namespace,'metafield_key':mfkey,'metafield_type':dest_mf.get('type'),'compare_digest':dest_mf.get('compareDigest'),'mode':target['mode']} if dest_mf and target['mode']!='readonly' and dest_mf.get('type') in {'single_line_text_field','multi_line_text_field','rich_text_field','html'} else None)
             fields.append({'key':key,'label':f'Variante · {identity_label} · {namespace} / {mfkey} ({mf.get("type","")})','values':values,'edits':edits})
     columns=[{'label':'ES · español (base)'}]+[{'label':t['label']} for t in targets]
     if not sku: notices.append('El producto de ES no tiene SKU; no se pudo proponer una correspondencia automática en otras tiendas.')
     for t in targets:
         if not t['product']: notices.append(f'{t["store"]} · {t["locale"]}: no hay producto equivalente localizado por correspondencia o SKU.')
     return {'source':{'id':source['id'],'title':source['title'],'sku':sku},'columns':columns,'fields':fields,'notices':list(dict.fromkeys(notices))}
+
+def remember_manual_correction(x:CellTranslation):
+    src=(x.source_value or '').strip()
+    dst=x.value.strip()
+    if src and dst and src!=dst and len(src)<=500 and len(dst)<=500:
+        with pool.connection() as c:
+            c.execute("INSERT INTO translation_memory(source_locale,target_locale,source_text,target_text) VALUES('es-ES',%s,%s,%s) ON CONFLICT(source_locale,target_locale,source_text) DO UPDATE SET target_text=EXCLUDED.target_text,created_at=now()",(x.locale,src,dst))
+
+@app.post('/api/translate-cell')
+def translate_cell(x:CellTranslateRequest,user=Depends(operator)):
+    if x.field_key=='handle' or x.metafield_type=='rich_text_field': raise HTTPException(400,'Este tipo de campo requiere adaptación manual antes de traducirse')
+    if not os.getenv('DEEPL_AUTH_KEY','').strip(): raise HTTPException(503,'DeepL no está configurado en el servidor')
+    with pool.connection() as c:
+        exact=c.execute("SELECT target_text FROM translation_memory WHERE source_locale=%s AND target_locale=%s AND source_text=%s",(x.source_locale,x.target_locale,x.source_text.strip())).fetchone()
+        terms=c.execute("SELECT source_term,target_term FROM translation_glossary WHERE source_locale=%s AND target_locale=%s AND enabled ORDER BY length(source_term) DESC",(x.source_locale,x.target_locale)).fetchall()
+    if exact: return {'translation':exact[0],'memory_hit':True}
+    # Keep approved terms intact across DeepL without exposing a glossary or API key
+    # to the browser. Replace only text nodes when the value contains HTML.
+    import html as html_module
+    tokens={}; text=x.source_text
+    segments=re.split(r'(<[^>]+>)',text) if x.html else [text]
+    for i,segment in enumerate(segments):
+        if segment.startswith('<') and segment.endswith('>'): continue
+        for n,(source_term,target_term) in enumerate(terms):
+            marker=f'ZXQGLOSSARY{n:04d}QXZ'
+            pattern=re.compile(re.escape(source_term),re.IGNORECASE)
+            if pattern.search(segment):
+                segment=pattern.sub(marker,segment)
+                tokens[marker]=html_module.escape(target_term) if x.html else target_term
+        segments[i]=segment
+    protected=''.join(segments)
+    try:
+        from .worker import deepl_translate
+        translated=deepl_translate([protected],x.target_locale,handle_html=x.html)[0]
+    except RuntimeError as exc:
+        raise HTTPException(502,str(exc)[:500])
+    for marker,target_term in tokens.items(): translated=translated.replace(marker,target_term)
+    return {'translation':translated,'memory_hit':False,'glossary_terms':len(tokens)}
+
+@app.get('/api/glossary')
+def list_glossary(target_locale:str|None=None,user=Depends(operator)):
+    with pool.connection() as c:
+        rows=c.execute("SELECT id,source_locale,target_locale,source_term,target_term,enabled,origin FROM translation_glossary WHERE (%s IS NULL OR target_locale=%s) ORDER BY target_locale,source_term",(target_locale,target_locale)).fetchall()
+    return {'terms':[dict(zip(('id','source_locale','target_locale','source_term','target_term','enabled','origin'),r)) for r in rows]}
+
+@app.post('/api/glossary')
+def add_glossary_term(x:GlossaryTerm,user=Depends(operator)):
+    with pool.connection() as c:
+        row=c.execute("INSERT INTO translation_glossary(source_locale,target_locale,source_term,target_term,enabled) VALUES(%s,%s,%s,%s,%s) ON CONFLICT(source_locale,target_locale,source_term) DO UPDATE SET target_term=EXCLUDED.target_term,enabled=EXCLUDED.enabled,updated_at=now() RETURNING id",(x.source_locale,x.target_locale,x.source_term,x.target_term,x.enabled)).fetchone()
+    return {'id':row[0],'saved':True}
+
+@app.delete('/api/glossary/{term_id}')
+def delete_glossary_term(term_id:int,user=Depends(operator)):
+    with pool.connection() as c: c.execute('DELETE FROM translation_glossary WHERE id=%s',(term_id,))
+    return {'deleted':True}
 
 @app.post('/api/shopify/translations')
 def save_shopify_translation(x:CellTranslation,user=Depends(operator)):
@@ -500,6 +577,7 @@ def save_shopify_translation(x:CellTranslation,user=Depends(operator)):
             result=shopify_graphql(store['domain'],store['token'],mutation,variables).get('metafieldsSet') or {}
             errors=result.get('userErrors',[])
             if errors: raise HTTPException(400,'Shopify: '+'; '.join(error.get('message','error') for error in errors)[:500])
+            remember_manual_correction(x)
             return {'store':x.store,'resource_id':x.resource_id,'locale':x.locale,'key':x.key,'mode':'base','saved':True}
         if not resource_type.startswith('Product/') or x.owner_id!=x.resource_id:
             raise HTTPException(400,'El recurso de contenido base debe ser el producto de esa tienda')
@@ -513,6 +591,7 @@ def save_shopify_translation(x:CellTranslation,user=Depends(operator)):
         result=shopify_graphql(store['domain'],store['token'],mutation,{'product':product}).get('productUpdate') or {}
         errors=result.get('userErrors',[])
         if errors: raise HTTPException(400,'Shopify: '+'; '.join(error.get('message','error') for error in errors)[:500])
+        remember_manual_correction(x)
         return {'store':x.store,'resource_id':x.resource_id,'locale':x.locale,'key':x.key,'mode':'base','saved':True}
     if resource_type.startswith('Metafield/'):
         if x.key!='value': raise HTTPException(400,'La clave del metacampo no es válida')
@@ -528,6 +607,7 @@ def save_shopify_translation(x:CellTranslation,user=Depends(operator)):
     result=shopify_graphql(store['domain'],store['token'],mutation,{'id':x.resource_id,'translations':[{'locale':x.locale,'key':x.key,'value':x.value,'translatableContentDigest':digest}]}).get('translationsRegister') or {}
     errors=result.get('userErrors',[])
     if errors: raise HTTPException(400,'Shopify: '+'; '.join(error.get('message','error') for error in errors)[:500])
+    remember_manual_correction(x)
     return {'store':x.store,'resource_id':x.resource_id,'locale':x.locale,'key':x.key,'mode':'translation','saved':True}
 
 @app.put('/api/stores')

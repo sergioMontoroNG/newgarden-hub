@@ -26,7 +26,13 @@ La app es de uso interno y no requiere login. La interfaz está en `/`, el explo
 
 Las migraciones SQL se registran y aplican una sola vez al iniciar la app o el worker. La migración `002` elimina las tiendas independientes NL/PT, sus correspondencias y reglas; cancela los trabajos aún en cola y conserva el historial ya generado y los locales NL/PT de ES.
 
-Para activar DeepL, configura `TRANSLATION_PROVIDER=deepl` y la clave como `DEEPL_AUTH_KEY` en `.env`. DeepL API Free usa automáticamente `api-free.deepl.com` cuando la clave termina en `:fx`; las demás claves usan el endpoint Pro. Luego aplica la configuración recreando el worker: `docker compose up -d --force-recreate worker`. Las llamadas de traducción se hacen desde el worker y no exponen la clave al navegador.
+Para activar DeepL, configura `TRANSLATION_PROVIDER=deepl` y la clave como `DEEPL_AUTH_KEY` en `.env`. DeepL API Free usa automáticamente `api-free.deepl.com` cuando la clave termina en `:fx`; las demás claves usan el endpoint Pro. Luego aplica la configuración recreando el worker: `docker compose up -d --force-recreate worker`. Las llamadas del flujo por lotes salen desde el worker y las del editor desde la API del servidor; la clave no se expone al navegador.
+
+## Glosario y aprendizaje
+
+En `/glossary` se mantienen términos origen/destino por locale. Al usar `Traducir con DeepL` en una celda, el servicio protege los términos aprobados durante la llamada y los repone en la respuesta; en HTML solo procesa nodos de texto. Al guardar una edición manual exitosa, los pares de texto de hasta 500 caracteres se almacenan como memoria exacta por locale y se devuelven en usos posteriores sin otra llamada DeepL. Las correcciones no se convierten automáticamente en reglas léxicas generales: el operador puede promover expresiones repetidas al glosario.
+
+La API de traducción requiere `DEEPL_AUTH_KEY` en el servidor, no en el navegador, y conserva la revisión humana antes de guardar en Shopify.
 
 ## Flujo de humo con datos de ejemplo
 
@@ -78,9 +84,9 @@ Actualización: respaldar primero, obtener/revisar cambios del repositorio en es
 
 ## Estado y limitaciones
 
-- Comprobaciones realizadas anteriormente en esta VM son anteriores a la integración actual de DeepL; se verificaron healthcheck, cola y simulación de publicación. Aún hay que realizar una llamada supervisada usando una clave DeepL de prueba.
+- Comprobaciones realizadas anteriormente en esta VM son anteriores a la integración actual de DeepL; se verificaron healthcheck, cola y simulación de publicación. Aún hay que realizar una llamada supervisada usando una clave DeepL de prueba para validar la integración en esa cuenta.
 - Implementado: gestión web de tiendas/locales/tokens Shopify, importación manual con hash/versionado, mapping explícito, trabajos únicos por producto/tienda/local/version, worker secuencial, DeepL API para título, descripción HTML, SEO y textos alternativos, modo fake, parada por cuota y errores de proveedor, resultados históricos, chequeos QA básicos, aprobación de campos y registro de publicación simulada.
-- Pendiente antes de uso con productos reales: configurar una clave DeepL y validar una generación supervisada; confirmar códigos locales mediante Shopify; automatizar la publicación aprobada desde la cola, auditoría, reglas/glosarios, colisiones de handle, QA ampliado, backup automatizado/verificado y endurecimiento CSRF/TLS/rate limit. El explorador de productos ya guarda traducciones por celda directamente en Shopify.
+- Pendiente antes de uso con productos reales: configurar una clave DeepL y validar una generación supervisada; confirmar códigos locales mediante Shopify; automatizar la publicación aprobada desde la cola, auditoría, glosarios remotos DeepL, colisiones de handle, QA ampliado, backup automatizado/verificado y endurecimiento CSRF/TLS/rate limit. El explorador permite traducir producto y metacampos de texto con DeepL antes de guardar; `/glossary` gestiona términos preferidos por locale y cada guardado manual aprende una memoria exacta reutilizable para el mismo texto.
 - No existe fallback API, compras de créditos, cron de reintento ni publicación automática. Shopify real está desactivado incluso si `SIMULATION=false`.
 - Las tareas `BLOCKED_MAPPING` no se ejecutan hasta importar una correspondencia con GID destino.
 
