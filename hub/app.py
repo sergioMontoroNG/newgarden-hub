@@ -58,6 +58,12 @@ class CellTranslateRequest(BaseModel):
     html:bool=False
     field_key:str=Field(min_length=1,max_length=255)
     metafield_type:str|None=None
+class TranslationBatchRequest(BaseModel):
+    sku:str=Field(min_length=1,max_length=120)
+class TranslationBatchItemIds(BaseModel):
+    item_ids:list[int]=Field(min_length=1,max_length=500)
+class TranslationBatchItemEdit(BaseModel):
+    proposed_text:str=Field(max_length=200000)
 class StoreConfig(BaseModel):
     code:str=Field(pattern=r'^[A-Z0-9_-]{2,12}$')
     domain:str=Field(min_length=3,max_length=255)
@@ -284,7 +290,7 @@ def product_browser(q:str='',source_id:str=''):
             notices=''.join(f'<p class="muted">{esc(n)}</p>' for n in data['notices'])
             detail=f'''<section class="card"><h2>Comparación del producto</h2><p class="lede">El locale principal de cada tienda actualiza el contenido base; los locales secundarios guardan traducciones Shopify. En descripciones, el editor conserva el HTML.</p><h3>{esc(data['source']['title'])}</h3><p class="muted">SKU: {esc(data['source']['sku'] or '—')} · {esc(data['source']['id'])}</p>{notices}<div class="comparison-scroll"><table><thead><tr><th>Campo</th>{cols}</tr></thead><tbody>{''.join(rows)}</tbody></table></div><dialog class="edit-dialog" id="cell-editor"><form method="dialog" id="cell-edit-form"><h2>Editar contenido</h2><p id="edit-context" class="muted"></p><p class="html-note muted">La descripción se guarda como HTML. Puedes editar etiquetas como &lt;p&gt;, &lt;ul&gt; y &lt;strong&gt;.</p><textarea id="edit-value" aria-label="Contenido"></textarea><div class="actions"><button type="button" class="secondary" id="translate-cell">Traducir con DeepL</button><button type="submit" id="save-cell">Guardar en Shopify</button><button type="button" class="secondary" id="cancel-cell">Cancelar</button><span id="edit-status" class="status" role="status"></span></div></form></dialog></section><script>
 const editor=document.querySelector('#cell-editor'),form=document.querySelector('#cell-edit-form'),area=document.querySelector('#edit-value');let editTarget=null;
-document.querySelectorAll('.cell-edit').forEach(button=>button.addEventListener('click',()=>{{editTarget=JSON.parse(button.dataset.edit);area.value=editTarget.value||'';document.querySelector('#edit-context').textContent=editTarget.store+' · '+editTarget.locale+' · '+editTarget.key+' · '+(editTarget.mode==='base'?'Contenido base':'Traducción');editor.classList.toggle('html-mode',editTarget.key==='body_html');document.querySelector('#edit-status').textContent='';document.querySelector('#translate-cell').disabled=editTarget.key==='handle'||editTarget.metafield_type==='rich_text_field'||!editTarget.source_value;editor.showModal()}}));
+document.querySelectorAll('.cell-edit').forEach(button=>button.addEventListener('click',()=>{{editTarget=JSON.parse(button.dataset.edit);area.value=editTarget.value||'';document.querySelector('#edit-context').textContent=editTarget.store+' · '+editTarget.locale+' · '+editTarget.key+' · '+(editTarget.mode==='base'?'Contenido base':'Traducción');editor.classList.toggle('html-mode',editTarget.key==='body_html');document.querySelector('#edit-status').textContent='';document.querySelector('#translate-cell').disabled=editTarget.key==='handle'||!editTarget.source_value;editor.showModal()}}));
 document.querySelectorAll('.more').forEach(button=>button.addEventListener('click',()=>{{button.previousElementSibling.textContent=button.dataset.full;button.remove()}}));
 document.querySelector('#cancel-cell').addEventListener('click',()=>editor.close());
 document.querySelector('#translate-cell').addEventListener('click',async()=>{{if(!editTarget)return;const button=document.querySelector('#translate-cell'),status=document.querySelector('#edit-status');button.disabled=true;status.textContent='Traduciendo…';try{{const response=await fetch('/api/translate-cell',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{source_text:editTarget.source_value||'',source_store:'ES',source_locale:'es-ES',target_store:editTarget.store,target_locale:editTarget.locale,field_key:editTarget.key,metafield_type:editTarget.metafield_type,html:editTarget.key==='body_html'||editTarget.metafield_type==='html'}})}});const result=await response.json();if(!response.ok)throw new Error(result.detail||'Error de traducción');area.value=result.translation;status.textContent=result.memory_hit?'Texto recordado':(result.glossary_terms?`Traducción lista · ${{result.glossary_terms}} término(s) del glosario aplicado(s)`:'Traducción lista para revisar')}}catch(error){{status.textContent=error.message}}finally{{button.disabled=false}}}});
@@ -327,11 +333,11 @@ const storeSelect=document.querySelector('#target-store'),localeSelect=document.
 async function loadStores(){try{const r=await fetch('/api/stores'),data=await r.json();if(!r.ok)throw new Error(data.detail||'No se pudieron cargar las tiendas');activeStores=data.filter(s=>s.active&&s.has_token);storeSelect.innerHTML=data.map(s=>`<option value="${esc(s.code)}" ${!s.active||!s.has_token?'disabled':''}>${esc(s.code)} · ${esc(s.domain||'sin dominio')}${!s.active?' · inactiva':!s.has_token?' · falta token':''}</option>`).join('');if(!activeStores.length){storeSelect.disabled=true;status.textContent='Activa la tienda destino y configura su token en Tiendas para habilitarla.';return}storeSelect.value=activeStores[0].code;storeSelect.disabled=false;await loadLocales()}catch(e){storeSelect.innerHTML='<option value="">No disponible</option>';status.textContent=e.message}}
 async function loadLocales(){const code=storeSelect.value;localeSelect.disabled=true;try{const r=await fetch('/api/stores/'+encodeURIComponent(code)+'/shop-locales'),data=await r.json();if(!r.ok)throw new Error(data.detail||'No se pudieron consultar locales');const choices=data.filter(x=>x.published&&!(code==='ES'&&x.primary));localeSelect.innerHTML=choices.map(x=>`<option value="${esc(x.locale)}">${esc(x.locale)}${x.primary?' · principal':''}</option>`).join('');if(!choices.length)throw new Error('Shopify no devolvió locales publicados editables');localeSelect.disabled=false}catch(e){localeSelect.innerHTML='<option value="">No hay locales editables</option>';status.textContent=e.message}}
 storeSelect.addEventListener('change',loadLocales);loadStores();
-const mainFields=new Set(['title','descriptionHtml','seo.title','seo.description']);
+const mainFields=new Set(['descriptionHtml','seo.title','seo.description']),textMetaTypes=new Set(['single_line_text_field','multi_line_text_field','html','rich_text_field','list.single_line_text_field','list.multi_line_text_field']);
 function note(card,message){const p=document.createElement('p');p.className='muted';p.textContent=message;card.append(p)}
 function fieldRow(field,edit,translation){const row=document.createElement('div');row.className='candidate';const label=document.createElement('strong');label.textContent=field.label;row.append(label);const source=document.createElement('p');source.className='muted';source.textContent='Origen: '+field.values[0];row.append(source);const editor=document.createElement('textarea');editor.setAttribute('aria-label','Propuesta para '+field.label);editor.value=translation;editor.style.width='100%';editor.style.minHeight=field.key==='descriptionHtml'?'140px':'72px';row.append(editor);const check=document.createElement('label');check.style.marginTop='8px';const input=document.createElement('input');input.type='checkbox';input.className='batch-approve';input.disabled=false;input.style.width='auto';input.dataset.edit=JSON.stringify(edit);check.append(input,document.createTextNode(' He revisado y apruebo este campo para guardarlo'));row.append(check);const state=document.createElement('span');state.className='status batch-state';row.append(state);return row}
 async function fetchJSON(url,options){const r=await fetch(url,options);let data={};try{data=await r.json()}catch{}if(!r.ok)throw new Error(data.detail||'Error al procesar la solicitud');return data}
-async function prepareSku(sku,store,locale){const card=document.createElement('section');card.className='card';const heading=document.createElement('h2');heading.textContent='SKU '+sku;card.append(heading);note(card,'Buscando producto…');results.append(card);try{const found=await fetchJSON('/api/shopify/products/search?q='+encodeURIComponent(sku));const sourceCandidates=found.products.filter(p=>p.store_codes.includes('ES')).flatMap(p=>p.candidates).filter(c=>String(c.sku||'').trim().toLowerCase()===sku.toLowerCase());const unique=[...new Map(sourceCandidates.map(c=>[c.id,c])).values()];if(unique.length!==1)throw new Error(unique.length?'SKU ambiguo: se encontraron varios productos en ES':'No se encontró un producto ES con ese SKU exacto');const product=unique[0];heading.textContent=product.title+' · SKU '+sku;const comparison=await fetchJSON('/api/shopify/products/compare?source_id='+encodeURIComponent(product.id)+'&target_store='+encodeURIComponent(store)+'&target_locale='+encodeURIComponent(locale));const applicable=comparison.fields.filter(f=>mainFields.has(f.key));let proposals=0;for(const field of applicable){const index=comparison.columns.findIndex((col,i)=>i>0&&col.label.startsWith(store+' · '+locale));if(index<1)continue;const edit=field.edits[index];const src=field.values[0];if(!edit||!src){continue}try{const answer=await fetchJSON('/api/translate-cell',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_text:src,source_store:'ES',source_locale:'es-ES',target_store:store,target_locale:locale,field_key:edit.key,html:field.key==='descriptionHtml'})});const row=fieldRow(field,edit,answer.translation);card.append(row);proposals++}catch(e){note(card,field.label+': '+e.message)}}const notices=comparison.notices||[];notices.forEach(n=>note(card,n));if(!proposals)note(card,'No hay campos principales editables con contenido para este destino.');else note(card,proposals+' propuesta(s). Marca solo las traducciones que hayas revisado.') }catch(e){note(card,e.message)}}
+async function prepareSku(sku,store,locale){const card=document.createElement('section');card.className='card';const heading=document.createElement('h2');heading.textContent='SKU '+sku;card.append(heading);note(card,'Buscando producto…');results.append(card);try{const found=await fetchJSON('/api/shopify/products/search?q='+encodeURIComponent(sku));const sourceCandidates=found.products.filter(p=>p.store_codes.includes('ES')).flatMap(p=>p.candidates).filter(c=>String(c.sku||'').trim().toLowerCase()===sku.toLowerCase());const unique=[...new Map(sourceCandidates.map(c=>[c.id,c])).values()];if(unique.length!==1)throw new Error(unique.length?'SKU ambiguo: se encontraron varios productos en ES':'No se encontró un producto ES con ese SKU exacto');const product=unique[0];heading.textContent=product.title+' · SKU '+sku;const comparison=await fetchJSON('/api/shopify/products/compare?source_id='+encodeURIComponent(product.id)+'&target_store='+encodeURIComponent(store)+'&target_locale='+encodeURIComponent(locale));const applicable=comparison.fields.filter(f=>mainFields.has(f.key)||(f.key.startsWith('metafield.')&&f.edits.some(edit=>edit&&textMetaTypes.has(edit.metafield_type))));let proposals=0;for(const field of applicable){const index=comparison.columns.findIndex((col,i)=>i>0&&col.label.startsWith(store+' · '+locale));if(index<1)continue;const edit=field.edits[index];const src=field.key.startsWith('metafield.')?edit?.source_value:field.values[0];if(!edit||!src){continue}try{const answer=await fetchJSON('/api/translate-cell',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_text:src,source_store:'ES',source_locale:'es-ES',target_store:store,target_locale:locale,field_key:edit.key,metafield_type:edit.metafield_type,html:field.key==='descriptionHtml'||edit.metafield_type==='html'})});const row=fieldRow(field,edit,answer.translation);card.append(row);proposals++}catch(e){note(card,field.label+': '+e.message)}}const notices=comparison.notices||[];notices.forEach(n=>note(card,n));if(!proposals)note(card,'No hay campos traducibles editables con contenido para este destino.');else note(card,proposals+' propuesta(s). Marca solo las traducciones que hayas revisado.') }catch(e){note(card,e.message)}}
 document.querySelector('#batch-form').addEventListener('submit',async e=>{e.preventDefault();const skus=[...new Set(document.querySelector('#skus').value.replaceAll(',',String.fromCharCode(10)).split(String.fromCharCode(10)).map(x=>x.trim()).filter(Boolean))];if(!skus.length)return;if(skus.length>50){status.textContent='El máximo es 50 SKU por ejecución.';return}if(!localeSelect.value){status.textContent='Selecciona un locale destino editable.';return}const run=document.querySelector('#prepare-batch');run.disabled=true;document.querySelector('#approve-batch').disabled=true;results.replaceChildren();const store=storeSelect.value,locale=localeSelect.value;status.textContent='Preparando '+skus.length+' producto(s) secuencialmente…';for(let i=0;i<skus.length;i++){status.textContent='Preparando '+(i+1)+'/'+skus.length+' · '+skus[i];await prepareSku(skus[i],store,locale)}run.disabled=false;document.querySelector('#approve-batch').disabled=!results.querySelector('.batch-approve');status.textContent='Preparación terminada. Revisa las propuestas y marca expresamente los campos que apruebas.'});
 document.querySelector('#approve-batch').addEventListener('click',async()=>{const button=document.querySelector('#approve-batch'),checks=[...results.querySelectorAll('.batch-approve:checked')];if(!checks.length){status.textContent='Marca al menos un campo que hayas revisado.';return}if(!confirm('¿Guardar en Shopify los '+checks.length+' campos marcados?'))return;button.disabled=true;let saved=0;for(const checkbox of checks){const row=checkbox.closest('.candidate'),state=row.querySelector('.batch-state'),edit=JSON.parse(checkbox.dataset.edit);state.textContent='Guardando…';try{await fetchJSON('/api/shopify/translations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...edit,value:row.querySelector('textarea').value})});checkbox.checked=false;checkbox.disabled=true;state.textContent='Guardado';saved++}catch(e){state.textContent=e.message}}button.disabled=false;status.textContent=saved+' campo(s) guardado(s) en Shopify.'});
 </script>'''
@@ -385,6 +391,9 @@ def search_shopify_products(q:str):
 
 @app.get('/api/shopify/products/compare')
 def compare_shopify_product(source_id:str,target_store:str|None=None,target_locale:str|None=None):
+    return _compare_shopify_product(source_id,target_store,target_locale)
+
+def _compare_shopify_product(source_id:str,target_store:str|None=None,target_locale:str|None=None,target_locales:dict[str,list[str]]|None=None):
     if (target_store is None)!=(target_locale is None): raise HTTPException(400,'Indica tienda y locale destino juntos')
     stores=shopify_stores(); by_code={s['code']:s for s in stores}; source_store=by_code.get('ES')
     if not source_store or not source_store['token']: raise HTTPException(503,'La tienda ES no tiene dominio y token configurados')
@@ -396,6 +405,7 @@ def compare_shopify_product(source_id:str,target_store:str|None=None,target_loca
     source_locales=list(source_store['locales'])
     if target_store=='ES' and target_locale and target_locale not in source_locales:
         source_locales.append(target_locale)
+    source_locales.extend(locale for locale in (target_locales or {}).get('ES',[]) if locale not in source_locales)
     source_lookup_locales=list(dict.fromkeys(shopify_locale_code(locale) for locale in source_locales))
     source=shopify_product(source_store,source_id,source_lookup_locales)
     if not source: raise HTTPException(404,'Producto no encontrado en la tienda ES')
@@ -423,6 +433,7 @@ def compare_shopify_product(source_id:str,target_store:str|None=None,target_loca
     for store in stores:
         if store['code']=='ES': continue
         locales=list(store['locales'])
+        locales.extend(locale for locale in (target_locales or {}).get(store['code'],[]) if locale not in locales)
         if store['code']==target_store and target_locale and target_locale not in locales:
             locales.append(target_locale)
         if not locales: continue
@@ -502,7 +513,7 @@ def compare_shopify_product(source_id:str,target_store:str|None=None,target_loca
             dest=next((item for item in (target['product'] or {}).get('metafields',{}).get('nodes',[]) if item['namespace']==namespace and item['key']==mfkey and not is_yotpo(item)),None)
             raw_mf_value=mf_value_raw(dest,target['lookup_locale'] if target['mode']=='translation' else None) if dest else None
             values.append(mf_value(dest,target['product'],target['lookup_locale'] if target['mode']=='translation' else None))
-            edits.append({'store':target['store'],'resource_id':dest['id'],'owner_id':target['product']['id'],'locale':target['lookup_locale'],'key':'value','value':raw_mf_value,'source_value':mf_value_raw(mf),'namespace':namespace,'metafield_key':mfkey,'metafield_type':dest.get('type'),'compare_digest':dest.get('compareDigest'),'mode':target['mode']} if dest and target['mode']!='readonly' and dest.get('type') in {'single_line_text_field','multi_line_text_field','rich_text_field','html'} else None)
+            edits.append({'store':target['store'],'resource_id':dest['id'],'owner_id':target['product']['id'],'locale':target['lookup_locale'],'key':'value','value':raw_mf_value,'source_value':mf_value_raw(mf),'namespace':namespace,'metafield_key':mfkey,'metafield_type':dest.get('type'),'compare_digest':dest.get('compareDigest'),'mode':target['mode']} if dest and target['mode']!='readonly' and dest.get('type') in {'single_line_text_field','multi_line_text_field','rich_text_field','html','list.single_line_text_field','list.multi_line_text_field'} else None)
         fields.append({'key':key,'label':f'Producto · {namespace} / {mfkey} ({mf.get("type","")})','values':values,'edits':edits})
     for source_variant in source_variants:
         variant_mfs=[item for item in source_variant.get('metafields',{}).get('nodes',[]) if not is_yotpo(item)]
@@ -522,7 +533,7 @@ def compare_shopify_product(source_id:str,target_store:str|None=None,target_loca
                 dest_mf=next((item for item in (dest_variant or {}).get('metafields',{}).get('nodes',[]) if item['namespace']==namespace and item['key']==mfkey and not is_yotpo(item)),None)
                 raw_mf_value=mf_value_raw(dest_mf,target['lookup_locale'] if target['mode']=='translation' else None) if dest_mf else None
                 values.append(mf_value(dest_mf,target['product'],target['lookup_locale'] if target['mode']=='translation' else None))
-                edits.append({'store':target['store'],'resource_id':dest_mf['id'],'owner_id':dest_variant['id'] if dest_variant else '', 'locale':target['lookup_locale'],'key':'value','value':raw_mf_value,'source_value':mf_value_raw(mf),'namespace':namespace,'metafield_key':mfkey,'metafield_type':dest_mf.get('type'),'compare_digest':dest_mf.get('compareDigest'),'mode':target['mode']} if dest_mf and target['mode']!='readonly' and dest_mf.get('type') in {'single_line_text_field','multi_line_text_field','rich_text_field','html'} else None)
+                edits.append({'store':target['store'],'resource_id':dest_mf['id'],'owner_id':dest_variant['id'] if dest_variant else '', 'locale':target['lookup_locale'],'key':'value','value':raw_mf_value,'source_value':mf_value_raw(mf),'namespace':namespace,'metafield_key':mfkey,'metafield_type':dest_mf.get('type'),'compare_digest':dest_mf.get('compareDigest'),'mode':target['mode']} if dest_mf and target['mode']!='readonly' and dest_mf.get('type') in {'single_line_text_field','multi_line_text_field','rich_text_field','html','list.single_line_text_field','list.multi_line_text_field'} else None)
             fields.append({'key':key,'label':f'Variante · {identity_label} · {namespace} / {mfkey} ({mf.get("type","")})','values':values,'edits':edits})
     columns=[{'label':'ES · español (base)'}]+[{'label':t['label']} for t in targets]
     if not sku: notices.append('El producto de ES no tiene SKU; no se pudo proponer una correspondencia automática en otras tiendas.')
@@ -539,7 +550,34 @@ def remember_manual_correction(x:CellTranslation):
 
 @app.post('/api/translate-cell')
 def translate_cell(x:CellTranslateRequest,user=Depends(operator)):
-    if x.field_key=='handle' or x.metafield_type=='rich_text_field': raise HTTPException(400,'Este tipo de campo requiere adaptación manual antes de traducirse')
+    if x.field_key=='handle': raise HTTPException(400,'El handle requiere adaptación manual antes de guardarse')
+    if x.metafield_type in {'rich_text_field','list.single_line_text_field','list.multi_line_text_field'}:
+        try: structured=json.loads(x.source_text)
+        except (TypeError,json.JSONDecodeError): raise HTTPException(400,'El metacampo estructurado no contiene JSON válido')
+        memory_hits=0; glossary_terms=0; translated_nodes=0
+        def translate_leaf(source):
+            nonlocal memory_hits,glossary_terms,translated_nodes
+            if not source.strip(): return source
+            leaf=CellTranslateRequest(source_text=source,source_store=x.source_store,source_locale=x.source_locale,target_store=x.target_store,target_locale=x.target_locale,field_key='metafield_text',html=False)
+            result=translate_cell(leaf,user)
+            memory_hits+=bool(result.get('memory_hit')); glossary_terms+=int(result.get('glossary_terms',0)); translated_nodes+=1
+            return result['translation']
+        def walk_text_nodes(node):
+            if isinstance(node,dict):
+                if node.get('type')=='text' and isinstance(node.get('value'),str):
+                    node['value']=translate_leaf(node['value'])
+                else:
+                    for child in node.values(): walk_text_nodes(child)
+            elif isinstance(node,list):
+                for child in node: walk_text_nodes(child)
+        if x.metafield_type=='rich_text_field':
+            if not isinstance(structured,dict) or structured.get('type')!='root': raise HTTPException(400,'Rich text debe tener un nodo raíz Shopify válido')
+            walk_text_nodes(structured)
+        else:
+            if not isinstance(structured,list) or not all(isinstance(item,str) for item in structured): raise HTTPException(400,'La lista del metacampo debe contener textos')
+            structured=[translate_leaf(item) for item in structured]
+        if not translated_nodes: raise HTTPException(400,'El metacampo no contiene texto traducible')
+        return {'translation':json.dumps(structured,ensure_ascii=False,separators=(',',':')),'memory_hit':memory_hits==translated_nodes,'glossary_terms':glossary_terms}
     if not os.getenv('DEEPL_AUTH_KEY','').strip(): raise HTTPException(503,'DeepL no está configurado en el servidor')
     with pool.connection() as c:
         exact=c.execute("""SELECT target_text FROM translation_memory
@@ -643,7 +681,7 @@ def save_shopify_translation(x:CellTranslation,user=Depends(operator)):
     resource_type=x.resource_id.removeprefix('gid://shopify/')
     if mode=='base':
         if resource_type.startswith('Metafield/'):
-            if x.key!='value' or not x.namespace or not x.owner_id.startswith(('gid://shopify/Product/','gid://shopify/ProductVariant/')) or x.metafield_type not in {'single_line_text_field','multi_line_text_field','rich_text_field','html'}:
+            if x.key!='value' or not x.namespace or not x.owner_id.startswith(('gid://shopify/Product/','gid://shopify/ProductVariant/')) or x.metafield_type not in {'single_line_text_field','multi_line_text_field','rich_text_field','html','list.single_line_text_field','list.multi_line_text_field'}:
                 raise HTTPException(400,'Datos de metacampo no válidos para editar el contenido base')
             mutation='''mutation SetBaseMetafield($metafields:[MetafieldsSetInput!]!) { metafieldsSet(metafields:$metafields) { userErrors { field message } } }'''
             if not x.metafield_key: raise HTTPException(400,'Falta la clave Shopify del metacampo')
@@ -683,6 +721,124 @@ def save_shopify_translation(x:CellTranslation,user=Depends(operator)):
     if errors: raise HTTPException(400,'Shopify: '+'; '.join(error.get('message','error') for error in errors)[:500])
     remember_manual_correction(x)
     return {'store':x.store,'resource_id':x.resource_id,'locale':x.locale,'key':x.key,'mode':'translation','saved':True}
+
+def translation_batch_payload(batch_id:int):
+    with pool.connection() as c:
+        batch=c.execute('SELECT id,source_sku,source_product_gid,source_title,state,error,created_at,updated_at FROM translation_batches WHERE id=%s',(batch_id,)).fetchone()
+        if not batch: raise HTTPException(404,'Lote de traducción no encontrado')
+        rows=c.execute('SELECT id,store_code,locale,field_key,field_label,source_text,proposed_text,edit_payload,state,error,created_at,updated_at FROM translation_batch_items WHERE batch_id=%s ORDER BY id',(batch_id,)).fetchall()
+    return {'id':batch[0],'sku':batch[1],'source_product_gid':batch[2],'source_title':batch[3],'state':batch[4],'error':batch[5],'created_at':batch[6],'updated_at':batch[7],
+      'items':[dict(zip(('id','store','locale','field_key','field_label','source_text','proposed_text','edit_payload','state','error','created_at','updated_at'),row)) for row in rows]}
+
+@app.post('/api/translation-batches')
+def create_translation_batch(x:TranslationBatchRequest,user=Depends(operator)):
+    sku=x.sku.strip()
+    stores=shopify_stores(); source_store=next((s for s in stores if s['code']=='ES' and s['token']),None)
+    if not source_store: raise HTTPException(503,'La tienda ES no tiene dominio y token configurados')
+    hits=shopify_search(source_store,sku,20)
+    candidates=[p for p in hits if any((v.get('sku') or '').strip().casefold()==sku.casefold() for v in p.get('variants',{}).get('nodes',[]))]
+    unique={p['id']:p for p in candidates}
+    if not unique: raise HTTPException(404,'No se encontró un producto ES con ese SKU exacto')
+    if len(unique)>1: raise HTTPException(409,'El SKU coincide con varios productos de ES')
+    source_product=next(iter(unique.values()))
+    source_locale=next((item['locale'] for item in shopify_shop_locales(source_store) if item.get('primary')),'es-ES')
+    targets=[]; target_locales={}
+    for store in stores:
+        if not store['token']: continue
+        try: locales=shopify_shop_locales(store)
+        except HTTPException: continue
+        published=[item['locale'] for item in locales if item.get('published') and not (store['code']=='ES' and item.get('primary'))]
+        targets.extend((store['code'],locale) for locale in published)
+        if published: target_locales[store['code']]=published
+    if not targets: raise HTTPException(409,'No hay locales publicados de destino en las tiendas activas')
+    with pool.connection() as c:
+        batch_id=c.execute("INSERT INTO translation_batches(source_sku,source_product_gid,source_title,state) VALUES(%s,%s,%s,'PREPARING') RETURNING id",(sku,source_product['id'],source_product['title'])).fetchone()[0]
+    main_keys={'descriptionHtml','seo.title','seo.description'}
+    try:
+        comparison=_compare_shopify_product(source_product['id'],target_locales=target_locales)
+    except HTTPException as exc:
+        with pool.connection() as c:
+            for store_code,locale in targets:
+                c.execute('''INSERT INTO translation_batch_items(batch_id,store_code,locale,field_key,field_label,state,error)
+                  VALUES(%s,%s,%s,'__product__','Producto','ERROR',%s) ON CONFLICT(batch_id,store_code,locale,field_key) DO NOTHING''',
+                  (batch_id,store_code,locale,str(exc.detail)[:500]))
+            c.execute("UPDATE translation_batches SET state='READY_WITH_ERRORS',error=%s,updated_at=now() WHERE id=%s",(str(exc.detail)[:500],batch_id))
+        return translation_batch_payload(batch_id)
+    for store_code,locale in targets:
+        column_index=next((i for i,column in enumerate(comparison['columns']) if i>0 and column['label'].startswith(f'{store_code} · {locale}')),None)
+        target_items=0
+        for field in comparison['fields']:
+            if field['key'] not in main_keys and not field['key'].startswith('metafield.'): continue
+            edit_index=column_index
+            if edit_index is None or edit_index>=len(field.get('edits',[])) or not field['edits'][edit_index]:
+                edit_index=next((i for i,item in enumerate(field.get('edits',[])) if item and item.get('store')==store_code and item.get('locale')==locale),None)
+            edit=field.get('edits',[None]*len(field.get('values',[])))[edit_index] if edit_index is not None and edit_index<len(field.get('edits',[])) else None
+            source_text=(edit.get('source_value') if field['key'].startswith('metafield.') and edit else field['values'][0] if field.get('values') else '')
+            if not edit or not source_text: continue
+            try:
+                request=CellTranslateRequest(source_text=source_text,source_store='ES',source_locale=source_locale,target_store=store_code,target_locale=locale,field_key=edit['key'],metafield_type=edit.get('metafield_type'),html=field['key']=='descriptionHtml' or edit.get('metafield_type')=='html')
+                translated=translate_cell(request,user)
+                proposed=translated['translation']; state='PENDING_REVIEW'; error=None
+            except Exception as exc:
+                proposed=None; state='ERROR'; error=str(exc.detail if isinstance(exc,HTTPException) else exc)[:500]
+            with pool.connection() as c:
+                c.execute('''INSERT INTO translation_batch_items(batch_id,store_code,locale,field_key,field_label,source_text,proposed_text,edit_payload,state,error)
+                  VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(batch_id,store_code,locale,field_key) DO NOTHING''',
+                  (batch_id,store_code,locale,field['key'],field['label'],source_text,proposed,Jsonb(edit),state,error))
+            target_items+=1
+        if target_items==0:
+            with pool.connection() as c:
+                c.execute('''INSERT INTO translation_batch_items(batch_id,store_code,locale,field_key,field_label,state,error)
+                  VALUES(%s,%s,%s,'__product__','Producto','ERROR','No se encontró un producto equivalente o campos principales editables en el destino')
+                  ON CONFLICT(batch_id,store_code,locale,field_key) DO NOTHING''',(batch_id,store_code,locale))
+    with pool.connection() as c:
+        c.execute("UPDATE translation_batches SET state=CASE WHEN EXISTS(SELECT 1 FROM translation_batch_items WHERE batch_id=%s AND state='PENDING_REVIEW') THEN 'PENDING_REVIEW' ELSE 'READY_WITH_ERRORS' END,updated_at=now() WHERE id=%s",(batch_id,batch_id))
+    return translation_batch_payload(batch_id)
+
+@app.get('/api/translation-batches/{batch_id}')
+def get_translation_batch(batch_id:int,user=Depends(operator)):
+    return translation_batch_payload(batch_id)
+
+@app.patch('/api/translation-batches/{batch_id}/items/{item_id}')
+def edit_translation_batch_item(batch_id:int,item_id:int,x:TranslationBatchItemEdit,user=Depends(operator)):
+    with pool.connection() as c:
+        row=c.execute("UPDATE translation_batch_items SET proposed_text=%s,updated_at=now() WHERE id=%s AND batch_id=%s AND state='PENDING_REVIEW' RETURNING id",(x.proposed_text,item_id,batch_id)).fetchone()
+    if not row: raise HTTPException(409,'El campo no existe o ya no está pendiente de revisión')
+    return {'batch_id':batch_id,'item_id':item_id,'updated':True}
+
+@app.post('/api/translation-batches/{batch_id}/approve')
+def approve_translation_batch(batch_id:int,x:TranslationBatchItemIds,user=Depends(operator)):
+    with pool.connection() as c:
+        if not c.execute('SELECT 1 FROM translation_batches WHERE id=%s',(batch_id,)).fetchone(): raise HTTPException(404,'Lote de traducción no encontrado')
+        rows=c.execute("UPDATE translation_batch_items SET state='APPROVED',updated_at=now() WHERE batch_id=%s AND id=ANY(%s) AND state='PENDING_REVIEW' RETURNING id",(batch_id,x.item_ids)).fetchall()
+        if len(rows)!=len(set(x.item_ids)): raise HTTPException(409,'Uno o más campos no están pendientes para este lote')
+        c.execute("""UPDATE translation_batches b SET state=CASE
+          WHEN EXISTS(SELECT 1 FROM translation_batch_items i WHERE i.batch_id=b.id AND i.state='PENDING_REVIEW') THEN 'PENDING_REVIEW'
+          ELSE 'APPROVED' END,updated_at=now() WHERE b.id=%s""",(batch_id,))
+    return translation_batch_payload(batch_id)
+
+@app.post('/api/translation-batches/{batch_id}/apply')
+def apply_translation_batch(batch_id:int,user=Depends(operator)):
+    with pool.connection() as c:
+        rows=c.execute("SELECT id,proposed_text,edit_payload FROM translation_batch_items WHERE batch_id=%s AND state='APPROVED' ORDER BY id",(batch_id,)).fetchall()
+        if not rows:
+            if not c.execute('SELECT 1 FROM translation_batches WHERE id=%s',(batch_id,)).fetchone(): raise HTTPException(404,'Lote de traducción no encontrado')
+            raise HTTPException(409,'Aprueba al menos un campo antes de aplicarlo')
+    for item_id,proposed,payload in rows:
+        try:
+            save_shopify_translation(CellTranslation(**{**payload,'value':proposed}),user)
+            state='SAVED'; error=None
+        except (HTTPException,RuntimeError,ValueError) as exc:
+            state='APPLY_ERROR'; error=str(exc.detail if isinstance(exc,HTTPException) else exc)[:500]
+        with pool.connection() as c:
+            c.execute('UPDATE translation_batch_items SET state=%s,error=%s,updated_at=now() WHERE id=%s AND batch_id=%s',(state,error,item_id,batch_id))
+    with pool.connection() as c:
+        c.execute("""UPDATE translation_batches b SET state=CASE
+          WHEN EXISTS(SELECT 1 FROM translation_batch_items i WHERE i.batch_id=b.id AND i.state='PENDING_REVIEW') THEN 'PENDING_REVIEW'
+          WHEN EXISTS(SELECT 1 FROM translation_batch_items i WHERE i.batch_id=b.id AND i.state IN ('APPROVED','APPLY_ERROR')) THEN 'APPROVED'
+          WHEN EXISTS(SELECT 1 FROM translation_batch_items i WHERE i.batch_id=b.id AND i.state='SAVED') THEN 'COMPLETED'
+          ELSE 'READY_WITH_ERRORS' END,updated_at=now() WHERE b.id=%s""",(batch_id,))
+    return translation_batch_payload(batch_id)
 
 @app.put('/api/stores')
 def save_store(x:StoreConfig):
