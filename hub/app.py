@@ -41,6 +41,7 @@ class CellTranslation(BaseModel):
     metafield_type:str|None=Field(default=None,max_length=100)
     compare_digest:str|None=Field(default=None,max_length=255)
     source_value:str|None=Field(default=None,max_length=200000)
+    source_product_gid:str|None=Field(default=None,max_length=255)
 class GlossaryTerm(BaseModel):
     source_store:str=Field(min_length=2,max_length=12)
     source_locale:str=Field(default='es-ES',min_length=2,max_length=20)
@@ -212,7 +213,7 @@ def shell(title, body, active=''):
         'glossary': '<path d="M12 5v16M12 5C8 2 4 3 2 4v15c3-1 6-1 10 2 4-3 7-3 10-2V4c-3-1-6-2-10 1Z"/>',
         'stores': '<path d="M3 10v11h18V10M2 10l2-7h16l2 7M2 10h20M9 21v-7h6v7"/>',
     }
-    items = [('home','/','Resumen'),('products','/products','Productos'),('batch','/products/batch','Traducción en lote'),('glossary','/glossary','Glosario'),('stores','/stores','Tiendas')]
+    items = [('home','/','Resumen'),('products','/products','Gestión de productos'),('batch','/products/batch','Traducción en lote'),('glossary','/glossary','Glosario'),('stores','/stores','Tiendas')]
     links = ''.join(f'<a class="nav-link {"active" if key==active else ""}" href="{url}" {"aria-current=page" if key==active else ""}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{icons[key]}</svg>{label}</a>' for key,url,label in items)
     mark = '<span class="dotmark" aria-hidden="true">' + '<i></i>' * 9 + '</span>'
     body = body.replace('<main class="wrap">', '<main class="wrap" id="main-content" tabindex="-1">', 1)
@@ -294,11 +295,13 @@ def product_browser(q:str='',source_id:str=''):
                     edit=f.get('edits',[None]*len(f['values']))[column_index]
                     if edit:
                         encoded=esc(json.dumps(edit,ensure_ascii=False))
-                        shown=f'<span class="cell-display">{shown}</span><button type="button" class="cell-edit" data-edit="{encoded}">Editar celda</button>'
+                        states={'CURRENT':'Al día','OUTDATED':'Desactualizado','CONFLICT':'Cambio en destino','MISSING':'Falta en destino','UNTRACKED':'Sin referencia'}
+                        state=edit.get('sync_status','UNTRACKED')
+                        shown=f'<span class="cell-display">{shown}</span><span class="sync-state sync-{state.lower()}">{states.get(state,state)}</span><button type="button" class="cell-edit" data-edit="{encoded}">Editar celda</button>'
                     cells.append(f'<td>{shown}</td>')
                 rows.append(f'<tr><th>{esc(f["label"])}<br><code>{esc(f["key"])}</code></th>{"".join(cells)}</tr>')
             notices=''.join(f'<p class="muted">{esc(n)}</p>' for n in data['notices'])
-            detail=f'''<section class="card"><h2>Comparación del producto</h2><p class="lede">El locale principal de cada tienda actualiza el contenido base; los locales secundarios guardan traducciones Shopify. En descripciones, el editor conserva el HTML.</p><h3>{esc(data['source']['title'])}</h3><p class="muted">SKU: {esc(data['source']['sku'] or '—')} · {esc(data['source']['id'])}</p>{notices}<div class="comparison-scroll" tabindex="0" role="region" aria-label="Comparación de contenido por tienda e idioma"><table><thead><tr><th>Campo</th>{cols}</tr></thead><tbody>{''.join(rows)}</tbody></table></div><dialog class="edit-dialog t-modal" id="cell-editor" aria-labelledby="edit-title"><form method="dialog" id="cell-edit-form"><h2 id="edit-title">Editar contenido</h2><p id="edit-context" class="muted"></p><p class="html-note muted">La descripción se guarda como HTML. Puedes editar etiquetas como &lt;p&gt;, &lt;ul&gt; y &lt;strong&gt;.</p><textarea id="edit-value" aria-label="Contenido"></textarea><div class="actions"><button type="button" class="secondary" id="translate-cell">Traducir con DeepL</button><button type="submit" id="save-cell">Guardar en Shopify</button><button type="button" class="secondary" id="cancel-cell">Cancelar</button><span id="edit-status" class="status" role="status"></span></div></form></dialog></section><script>
+            detail=f'''<section class="card"><h2>Panel de producto e idiomas</h2><p class="lede">Compara y edita los campos por tienda e idioma. El estado se controla campo a campo: al día, desactualizado, falta en destino, cambio en destino o sin referencia histórica. Los datos anteriores a este panel se marcan sin referencia hasta volver a guardarlos desde aquí.</p><h3>{esc(data['source']['title'])}</h3><p class="muted">SKU: {esc(data['source']['sku'] or '—')} · {esc(data['source']['id'])}</p>{notices}<div class="comparison-scroll" tabindex="0" role="region" aria-label="Comparación de contenido por tienda e idioma"><table><thead><tr><th>Campo</th>{cols}</tr></thead><tbody>{''.join(rows)}</tbody></table></div><dialog class="edit-dialog t-modal" id="cell-editor" aria-labelledby="edit-title"><form method="dialog" id="cell-edit-form"><h2 id="edit-title">Editar contenido</h2><p id="edit-context" class="muted"></p><p class="html-note muted">La descripción se guarda como HTML. Puedes editar etiquetas como &lt;p&gt;, &lt;ul&gt; y &lt;strong&gt;.</p><textarea id="edit-value" aria-label="Contenido"></textarea><div class="actions"><button type="button" class="secondary" id="translate-cell">Traducir con DeepL</button><button type="submit" id="save-cell">Guardar en Shopify</button><button type="button" class="secondary" id="cancel-cell">Cancelar</button><span id="edit-status" class="status" role="status"></span></div></form></dialog></section><script>
 const editor=document.querySelector('#cell-editor'),form=document.querySelector('#cell-edit-form'),area=document.querySelector('#edit-value');let editTarget=null;
 document.querySelectorAll('.cell-edit').forEach(button=>button.addEventListener('click',()=>{{editTarget=JSON.parse(button.dataset.edit);area.value=editTarget.value||'';document.querySelector('#edit-context').textContent=editTarget.store+' · '+editTarget.locale+' · '+editTarget.key+' · '+(editTarget.mode==='base'?'Contenido base':'Traducción');editor.classList.toggle('html-mode',editTarget.key==='body_html');document.querySelector('#edit-status').textContent='';document.querySelector('#translate-cell').disabled=editTarget.key==='handle'||!editTarget.source_value;openEditor()}}));
 document.querySelectorAll('.more').forEach(button=>button.addEventListener('click',()=>{{button.previousElementSibling.textContent=button.dataset.full;button.remove()}}));
@@ -337,7 +340,7 @@ form.addEventListener('submit',async event=>{{event.preventDefault();if(!editTar
             results=f'<section class="card"><h2>No se pudo completar la búsqueda</h2><p>{html.escape(str(exc.detail))}</p></section>'
     empty = '<section class="empty-state"><h2>Empieza con un producto</h2><p class="muted">Introduce un SKU, nombre o ID. Después selecciona un resultado de ES para comparar los idiomas y editar su contenido.</p></section>' if not term and not source_id else ''
     value=html.escape(term,quote=True)
-    body=f'''<main class="wrap"><h1>Explorador de productos</h1><p class="lede">Busca por SKU, nombre, ID o texto en todas las tiendas activas. Selecciona un resultado de ES para abrir la comparación.</p><section class="card search-panel"><form action="/products" method="get"><div class="field"><label for="term">SKU, nombre o ID de Shopify</label><input id="term" name="q" value="{value}" required placeholder="Ej. NG-1234, lámpara exterior o gid://shopify/Product/…"></div><div class="actions"><button type="submit">Buscar en tiendas</button></div></form></section><section class="batch-shortcut"><div><h2>¿Varios productos a la vez?</h2><p class="muted">Prepara una lista de SKU y revisa cada propuesta antes de guardar.</p></div><a class="button secondary" href="/products/batch">Traducción en lote <span aria-hidden="true">↗</span></a></section>{detail}{results}{empty}</main>'''
+    body=f'''<main class="wrap"><h1>Gestión de productos</h1><p class="lede">Busca por SKU, nombre, ID o texto en todas las tiendas activas. Abre un producto de España para revisar los campos y su estado por tienda e idioma.</p><section class="card search-panel"><form action="/products" method="get"><div class="field"><label for="term">SKU, nombre o ID de Shopify</label><input id="term" name="q" value="{value}" required placeholder="Ej. NG-1234, lámpara exterior o gid://shopify/Product/…"></div><div class="actions"><button type="submit">Buscar en tiendas</button></div></form></section><section class="batch-shortcut"><div><h2>¿Varios productos a la vez?</h2><p class="muted">Prepara una lista de SKU y revisa cada propuesta antes de guardar.</p></div><a class="button secondary" href="/products/batch">Traducción en lote <span aria-hidden="true">↗</span></a></section>{detail}{results}{empty}</main>'''
     return shell('Explorador de productos',body,'products')
 
 @app.get('/products/batch',response_class=HTMLResponse)
@@ -506,7 +509,7 @@ def _compare_shopify_product(source_id:str,target_store:str|None=None,target_loc
             if not value and target.get('uses_base_fields') and target['mode']=='translation': value=product_field_value(product,key)
             values.append(value)
             editable={'title','body_html','handle','seo_title','seo_description','vendor','product_type'}
-            edits.append({'store':target['store'],'resource_id':product['id'],'owner_id':product['id'],'locale':target['lookup_locale'],'key':keymap[key],'value':value,'source_value':val,'mode':target['mode']} if product and target['mode']!='readonly' and keymap.get(key) in editable else None)
+            edits.append({'store':target['store'],'resource_id':product['id'],'owner_id':product['id'],'source_product_gid':source_id,'locale':target['lookup_locale'],'key':keymap[key],'value':value,'source_value':val,'mode':target['mode']} if product and target['mode']!='readonly' and keymap.get(key) in editable else None)
         fields.append({'key':key,'label':key.replace('.',' / '),'values':values,'edits':edits})
     # Rows are defined by the Spanish source. A missing key and an empty value
     # are shown distinctly in every destination.
@@ -534,7 +537,7 @@ def _compare_shopify_product(source_id:str,target_store:str|None=None,target_loc
             dest=next((item for item in (target['product'] or {}).get('metafields',{}).get('nodes',[]) if item['namespace']==namespace and item['key']==mfkey and not is_yotpo(item)),None)
             raw_mf_value=mf_value_raw(dest,target['lookup_locale'] if target['mode']=='translation' else None) if dest else None
             values.append(mf_value(dest,target['product'],target['lookup_locale'] if target['mode']=='translation' else None))
-            edits.append({'store':target['store'],'resource_id':dest['id'],'owner_id':target['product']['id'],'locale':target['lookup_locale'],'key':'value','value':raw_mf_value,'source_value':mf_value_raw(mf),'namespace':namespace,'metafield_key':mfkey,'metafield_type':dest.get('type'),'compare_digest':dest.get('compareDigest'),'mode':target['mode']} if dest and target['mode']!='readonly' and dest.get('type') in {'single_line_text_field','multi_line_text_field','rich_text_field','html','list.single_line_text_field','list.multi_line_text_field'} else None)
+            edits.append({'store':target['store'],'resource_id':dest['id'],'owner_id':target['product']['id'],'source_product_gid':source_id,'locale':target['lookup_locale'],'key':'value','value':raw_mf_value,'source_value':mf_value_raw(mf),'namespace':namespace,'metafield_key':mfkey,'metafield_type':dest.get('type'),'compare_digest':dest.get('compareDigest'),'mode':target['mode']} if dest and target['mode']!='readonly' and dest.get('type') in {'single_line_text_field','multi_line_text_field','rich_text_field','html','list.single_line_text_field','list.multi_line_text_field'} else None)
         fields.append({'key':key,'label':f'Producto · {namespace} / {mfkey} ({mf.get("type","")})','values':values,'edits':edits})
     for source_variant in source_variants:
         variant_mfs=[item for item in source_variant.get('metafields',{}).get('nodes',[]) if not is_yotpo(item)]
@@ -554,8 +557,32 @@ def _compare_shopify_product(source_id:str,target_store:str|None=None,target_loc
                 dest_mf=next((item for item in (dest_variant or {}).get('metafields',{}).get('nodes',[]) if item['namespace']==namespace and item['key']==mfkey and not is_yotpo(item)),None)
                 raw_mf_value=mf_value_raw(dest_mf,target['lookup_locale'] if target['mode']=='translation' else None) if dest_mf else None
                 values.append(mf_value(dest_mf,target['product'],target['lookup_locale'] if target['mode']=='translation' else None))
-                edits.append({'store':target['store'],'resource_id':dest_mf['id'],'owner_id':dest_variant['id'] if dest_variant else '', 'locale':target['lookup_locale'],'key':'value','value':raw_mf_value,'source_value':mf_value_raw(mf),'namespace':namespace,'metafield_key':mfkey,'metafield_type':dest_mf.get('type'),'compare_digest':dest_mf.get('compareDigest'),'mode':target['mode']} if dest_mf and target['mode']!='readonly' and dest_mf.get('type') in {'single_line_text_field','multi_line_text_field','rich_text_field','html','list.single_line_text_field','list.multi_line_text_field'} else None)
+                edits.append({'store':target['store'],'resource_id':dest_mf['id'],'owner_id':dest_variant['id'] if dest_variant else '', 'source_product_gid':source_id,'locale':target['lookup_locale'],'key':'value','value':raw_mf_value,'source_value':mf_value_raw(mf),'namespace':namespace,'metafield_key':mfkey,'metafield_type':dest_mf.get('type'),'compare_digest':dest_mf.get('compareDigest'),'mode':target['mode']} if dest_mf and target['mode']!='readonly' and dest_mf.get('type') in {'single_line_text_field','multi_line_text_field','rich_text_field','html','list.single_line_text_field','list.multi_line_text_field'} else None)
             fields.append({'key':key,'label':f'Variante · {identity_label} · {namespace} / {mfkey} ({mf.get("type","")})','values':values,'edits':edits})
+    # Keep synchronization state per editable field and destination. Older Shopify
+    # values have no baseline and are deliberately reported as unknown until saved
+    # through this hub once.
+    with pool.connection() as c:
+        sync_rows=c.execute('SELECT store_code,locale,resource_id,field_key,source_hash,target_hash FROM product_field_sync_state WHERE source_product_gid=%s',(source_id,)).fetchall()
+    sync_state={(row[0],row[1],row[2],row[3]):(row[4],row[5]) for row in sync_rows}
+    def value_hash(value): return hashlib.sha256(str(value or '').encode()).hexdigest()
+    for field in fields:
+        for idx,edit in enumerate(field['edits']):
+            if not edit: continue
+            source_value=edit.get('source_value') if edit.get('source_value') is not None else (field['values'][0] if field['values'] else '')
+            destination_value=edit.get('value') or ''
+            baseline=sync_state.get((edit['store'],edit['locale'],edit['resource_id'],edit['key']))
+            if not destination_value and source_value:
+                status='MISSING'
+            elif not baseline:
+                status='UNTRACKED'
+            elif value_hash(destination_value)!=baseline[1]:
+                status='CONFLICT'
+            elif value_hash(source_value)!=baseline[0]:
+                status='OUTDATED'
+            else:
+                status='CURRENT'
+            edit['sync_status']=status
     columns=[{'label':'ES · español (base)'}]+[{'label':t['label']} for t in targets]
     if not sku: notices.append('El producto de ES no tiene SKU; no se pudo proponer una correspondencia automática en otras tiendas.')
     for t in targets:
@@ -711,6 +738,7 @@ def save_shopify_translation(x:CellTranslation,user=Depends(operator)):
             errors=result.get('userErrors',[])
             if errors: raise HTTPException(400,'Shopify: '+'; '.join(error.get('message','error') for error in errors)[:500])
             remember_manual_correction(x)
+            record_field_sync_state(x)
             return {'store':x.store,'resource_id':x.resource_id,'locale':x.locale,'key':x.key,'mode':'base','saved':True}
         if not resource_type.startswith('Product/') or x.owner_id!=x.resource_id:
             raise HTTPException(400,'El recurso de contenido base debe ser el producto de esa tienda')
@@ -725,6 +753,7 @@ def save_shopify_translation(x:CellTranslation,user=Depends(operator)):
         errors=result.get('userErrors',[])
         if errors: raise HTTPException(400,'Shopify: '+'; '.join(error.get('message','error') for error in errors)[:500])
         remember_manual_correction(x)
+        record_field_sync_state(x)
         return {'store':x.store,'resource_id':x.resource_id,'locale':x.locale,'key':x.key,'mode':'base','saved':True}
     if resource_type.startswith('Metafield/'):
         if x.key!='value': raise HTTPException(400,'La clave del metacampo no es válida')
@@ -741,7 +770,19 @@ def save_shopify_translation(x:CellTranslation,user=Depends(operator)):
     errors=result.get('userErrors',[])
     if errors: raise HTTPException(400,'Shopify: '+'; '.join(error.get('message','error') for error in errors)[:500])
     remember_manual_correction(x)
+    record_field_sync_state(x)
     return {'store':x.store,'resource_id':x.resource_id,'locale':x.locale,'key':x.key,'mode':'translation','saved':True}
+
+def record_field_sync_state(x:CellTranslation):
+    source_id=x.source_product_gid or (x.owner_id if x.owner_id.startswith('gid://shopify/Product/') else '')
+    if not source_id: return
+    digest=lambda value: hashlib.sha256(str(value or '').encode()).hexdigest()
+    with pool.connection() as c:
+        c.execute('''INSERT INTO product_field_sync_state(source_product_gid,store_code,locale,resource_id,field_key,source_hash,target_hash)
+          VALUES(%s,%s,%s,%s,%s,%s,%s)
+          ON CONFLICT(source_product_gid,store_code,locale,resource_id,field_key) DO UPDATE
+          SET source_hash=EXCLUDED.source_hash,target_hash=EXCLUDED.target_hash,synced_at=now()''',
+          (source_id,x.store,x.locale,x.resource_id,x.key,digest(x.source_value),digest(x.value)))
 
 def translation_batch_payload(batch_id:int):
     with pool.connection() as c:

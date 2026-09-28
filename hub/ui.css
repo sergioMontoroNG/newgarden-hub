@@ -330,3 +330,7 @@ tbody tr:hover td { background: #f7f8f7; }
 @media (prefers-reduced-motion: reduce) {
   .t-modal { transition: none !important; }
 }
+.sync-state { display: inline-flex; margin-top: 10px; padding: 3px 7px; border: 1px solid var(--line); border-radius: 3px; color: var(--muted); font: 11px/1.5 var(--mono); }
+.sync-current { color: var(--green); border-color: #a7c8b3; background: #f2f8f4; }
+.sync-outdated, .sync-missing { color: #8a4b00; border-color: #dfc08f; background: #fff9ed; }
+.sync-conflict { color: #9e281f; border-color: #e2aaa5; background: #fff4f2; }
