@@ -74,6 +74,12 @@ Actualización: respaldar primero, obtener/revisar cambios del repositorio en es
 - No existe fallback API, compras de créditos, cron de reintento ni publicación automática. Shopify real está desactivado incluso si `SIMULATION=false`.
 - Las tareas `BLOCKED_MAPPING` no se ejecutan hasta importar una correspondencia con GID destino.
 
+## Desarrollo de la interfaz
+
+El sistema visual compartido está en `hub/ui.css`; `shell()` en `hub/app.py` construye la navegación y el marco de las páginas. El CSS se carga desde el paquete `hub`, que ya se incluye en la imagen Docker. No requiere compilación frontend ni fuentes externas. `PRODUCT.md` recoge el criterio de diseño.
+
+Para comprobar la interfaz de forma aislada, instala Playwright en tu entorno de desarrollo (`python -m pip install playwright`) y ejecuta `python scripts/check_ui.py`. Usa Microsoft Edge por defecto; para Chromium, ejecuta `python -m playwright install chromium` y configura `UI_BROWSER=chromium`. La prueba renderiza las funciones reales de las páginas con datos de prueba e intercepta todas las solicitudes: no contacta con Shopify, DeepL ni PostgreSQL. Comprueba seis vistas a cinco anchuras, búsqueda, edición, aprobación por campo, tiendas, glosario, teclado y movimiento reducido. Guarda capturas en una carpeta temporal indicada al finalizar. No sustituye las pruebas de integración con servicios reales.
+
 ## Fuentes consultadas
 
 - DeepL [Translate Text API](https://developers.deepl.com/api-reference/translate/request-translation) y [autenticación y endpoints](https://developers.deepl.com/docs/getting-started/auth).
