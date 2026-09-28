@@ -34,6 +34,8 @@ En `/glossary` cada término se define con tienda e idioma de origen y tienda e 
 
 La API de traducción requiere `DEEPL_AUTH_KEY` en el servidor, no en el navegador, y conserva la revisión humana antes de guardar en Shopify.
 
+En `/products/batch` se puede pegar una lista de hasta 50 SKU para preparar, secuencialmente, propuestas de título, descripción HTML, título SEO y descripción SEO para una tienda y locale elegidos. El flujo reutiliza la traducción con DeepL, el glosario y la memoria exacta del explorador. Cada propuesta aparece sin aprobar; hay que revisar y marcar expresamente cada campo y confirmar el guardado. La preparación no escribe en Shopify. La interfaz requiere mantener abierta la página mientras procesa la lista; los guardados aprobados se realizan campo a campo y los errores se muestran junto al campo correspondiente. La búsqueda y comparación de un producto en `/products` sigue disponible por separado.
+
 ## Operación
 
 ```sh
