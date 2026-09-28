@@ -1,6 +1,6 @@
 # Newgarden Content Hub (piloto aislado)
 
-Servicio separado del Compose existente del directorio padre. Cola persistente secuencial, aprobación campo a campo y publicación exclusivamente simulada. El worker admite DeepL API (`TRANSLATION_PROVIDER=deepl`) y `fake` para recorridos sin coste de traducción. La clave DeepL se configura en el `.env` local y solo se entrega al worker; no se incluye en el repositorio ni en el código del navegador.
+Servicio separado del Compose existente del directorio padre. Cola persistente secuencial, aprobación campo a campo y publicación exclusivamente simulada. El worker por lotes requiere DeepL API (`TRANSLATION_PROVIDER=deepl`); no genera traducciones de muestra. La clave DeepL se configura en el `.env` local y solo se entrega al worker; no se incluye en el repositorio ni en el código del navegador.
 
 ## Descubrimiento realizado
 
@@ -34,26 +34,6 @@ En `/glossary` cada término se define con tienda e idioma de origen y tienda e 
 
 La API de traducción requiere `DEEPL_AUTH_KEY` en el servidor, no en el navegador, y conserva la revisión humana antes de guardar en Shopify.
 
-## Flujo de humo con datos de ejemplo
-
-En terminal local protegida, guardar credenciales como variables sin ponerlas en el comando:
-
-```sh
-curl -H 'Content-Type: application/json' -d '{"product_key":"DEMO-LAMP-01","source":{"title":"Lámpara de muestra 230 V","description":"Ejemplo de demostración","image_alts":[]},"mappings":{"FR":{"shopify_product_gid":"gid://shopify/Product/DEMO-FR","handle":"lampe-demo"}}}' http://127.0.0.1:8787/api/products/import
-curl -H 'Content-Type: application/json' -d '{"product_key":"DEMO-LAMP-01","destinations":["ES","FR"]}' http://127.0.0.1:8787/api/jobs/enqueue
-curl -X POST http://127.0.0.1:8787/api/process/start
-curl http://127.0.0.1:8787/api/jobs
-```
-
-Con DeepL configurado, el worker traduce título, descripción HTML, campos SEO y textos alternativos de imágenes. Sin clave, el trabajo se detiene con un error de configuración; para una prueba sin traducción, establece `TRANSLATION_PROVIDER=fake`. Consulta el ID de trabajo en `/api/jobs/{id}/results`; aprueba los nombres de campos exactos presentes en esa respuesta, por ejemplo `title` y `seo_title`:
-
-```sh
-curl -H 'Content-Type: application/json' -d '{"fields":["title","seo_title"]}' http://127.0.0.1:8787/api/jobs/ID/approve
-curl -X POST http://127.0.0.1:8787/api/jobs/ID/publish
-```
-
-El último endpoint registra `SIMULATED_NO_WRITE`, sin hacer llamadas de escritura y dejando el trabajo aprobado. La prueba de cuota reproducible: parar el servicio, establecer `SIMULATE_QUOTA_AFTER=1` en `.env`, recrear contenedores, iniciar trabajos y usar `/api/process/start`; al llegar al siguiente trabajo, quedará pendiente y proceso en `STOPPED_QUOTA`. Borrar después esa variable y recrear contenedores; solo `/api/process/continue` reanuda. La simulación **no demuestra la forma de un error real de cuota**.
-
 ## Operación
 
 ```sh
@@ -85,7 +65,7 @@ Actualización: respaldar primero, obtener/revisar cambios del repositorio en es
 ## Estado y limitaciones
 
 - Comprobaciones realizadas anteriormente en esta VM son anteriores a la integración actual de DeepL; se verificaron healthcheck, cola y simulación de publicación. Aún hay que realizar una llamada supervisada usando una clave DeepL de prueba para validar la integración en esa cuenta.
-- Implementado: gestión web de tiendas/locales/tokens Shopify, importación manual con hash/versionado, mapping explícito, trabajos únicos por producto/tienda/local/version, worker secuencial, DeepL API para título, descripción HTML, SEO y textos alternativos, modo fake, parada por cuota y errores de proveedor, resultados históricos, chequeos QA básicos, aprobación de campos y registro de publicación simulada.
+- Implementado: gestión web de tiendas/locales/tokens Shopify, importación manual con hash/versionado, mapping explícito, trabajos únicos por producto/tienda/local/version, worker secuencial con DeepL API para título, descripción HTML, SEO y textos alternativos, parada por cuota y errores de proveedor, resultados históricos, chequeos QA básicos, aprobación de campos y registro de publicación simulada.
 - Pendiente antes de uso con productos reales: configurar una clave DeepL y validar una generación supervisada; confirmar códigos locales mediante Shopify; automatizar la publicación aprobada desde la cola, auditoría, glosarios remotos DeepL, colisiones de handle, QA ampliado, backup automatizado/verificado y endurecimiento CSRF/TLS/rate limit. El explorador permite traducir producto y metacampos de texto con DeepL antes de guardar; `/glossary` gestiona términos preferidos por par de tiendas y locale y cada guardado manual aprende una memoria exacta reutilizable para el mismo texto.
 - No existe fallback API, compras de créditos, cron de reintento ni publicación automática. Shopify real está desactivado incluso si `SIMULATION=false`.
 - Las tareas `BLOCKED_MAPPING` no se ejecutan hasta importar una correspondencia con GID destino.

@@ -20,25 +20,9 @@ def _deterministic_handle(source):
     return _slug(source.get('category'),source.get('model'),source.get('size'),source.get('approved_market_keyword'))[:80]
 
 def generate(product_key,locale,source):
-    mode=os.getenv('TRANSLATION_PROVIDER','fake').lower()
-    if mode=='deepl':
-        return generate_deepl(product_key,locale,source)
-    if mode!='fake': raise RuntimeError('TRANSLATION_PROVIDER debe ser fake o deepl')
-    def val(*keys, default=''):
-        for k in keys:
-            if isinstance(source.get(k),str) and source[k].strip(): return source[k].strip()
-        return default
-    base=val('title','name',default=product_key)
-    desc=val('description_html','description',default='')
-    target={'es-ES':'español de España','pt-PT':'portugués de Portugal','nl-NL':'neerlandés','fr-FR':'francés','de-DE':'alemán','it-IT':'italiano','en-GB':'inglés británico','es-MX':'español de México'}.get(locale,locale)
-    # This deterministic example is explicitly a proposal, not a genuine translation.
-    output={'product_key':product_key,'target':locale,'title':base,'description_html':desc,
-      'seo_title':base[:70],'seo_description':re.sub('<[^>]*>',' ',desc).strip()[:160],
-      'suggested_handle':re.sub(r'[^a-z0-9]+','-',base.lower()).strip('-')[:80],
-      'image_alts':source.get('image_alts',[]),'metafields':{},
-      'warnings':[f'DEMO: no se ha traducido; propuesta de muestra para {target}.']}
-    output['suggested_handle']=_deterministic_handle(source)
-    return output
+    mode=os.getenv('TRANSLATION_PROVIDER','deepl').lower()
+    if mode!='deepl': raise RuntimeError('El flujo por lotes requiere TRANSLATION_PROVIDER=deepl')
+    return generate_deepl(product_key,locale,source)
 
 def deepl_translate(values, locale, handle_html=False):
     key=os.getenv('DEEPL_AUTH_KEY','').strip()
@@ -100,11 +84,11 @@ def validate(out,source):
     source_text=json.dumps(source,ensure_ascii=False)
     for number in re.findall(r'\d+(?:[.,]\d+)?\s?(?:mm|cm|m|kg|g|W|V|lm|°C|%)?',source_text,re.I):
         if number and number not in json.dumps(out,ensure_ascii=False): errors.append(f'Cifra/unidad de origen no preservada: {number}')
-    return {'ok':not errors,'errors':errors,'provider':os.getenv('TRANSLATION_PROVIDER','fake'),'quota_detection_validated_in_production':False}
+    return {'ok':not errors,'errors':errors,'provider':os.getenv('TRANSLATION_PROVIDER','deepl'),'quota_detection_validated_in_production':False}
 
 def main():
     initialize()
-    print(f"worker ready (provider={os.getenv('TRANSLATION_PROVIDER','fake')})",flush=True)
+    print(f"worker ready (provider={os.getenv('TRANSLATION_PROVIDER','deepl')})",flush=True)
     with pool.connection() as conn:
         conn.autocommit=True
         if not conn.execute('SELECT pg_try_advisory_lock(%s)',(LOCK_ID,)).fetchone()[0]:
@@ -133,7 +117,7 @@ def main():
                 try:
                     out=generate(key,locale,source); validation=validate(out,source)
                     with conn.transaction():
-                        conn.execute('INSERT INTO localization_results(job_id,input,output,source_hash,prompt_version,rules_version,validation) VALUES(%s,%s,%s,%s,%s,%s,%s)',(jid,Jsonb(source),Jsonb(out),source_hash,'demo-v1','rules-v1',Jsonb(validation)))
+                        conn.execute('INSERT INTO localization_results(job_id,input,output,source_hash,prompt_version,rules_version,validation) VALUES(%s,%s,%s,%s,%s,%s,%s)',(jid,Jsonb(source),Jsonb(out),source_hash,'deepl-v1','rules-v1',Jsonb(validation)))
                         newstate='READY_FOR_REVIEW' if validation['ok'] else 'QA_FAILED'
                         conn.execute('UPDATE localization_jobs SET state=%s,reason=%s,updated_at=now() WHERE id=%s',(newstate,None if validation['ok'] else '; '.join(validation['errors']),jid))
                 except Exception as exc:
