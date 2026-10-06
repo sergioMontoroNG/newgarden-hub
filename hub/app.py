@@ -91,7 +91,7 @@ def shopify_graphql(domain, token, query, variables=None):
     if data.get('errors'): raise HTTPException(502,'Shopify GraphQL: '+str(data['errors'][0].get('message','error'))[:250])
     return data.get('data',{})
 
-PRODUCT_SELECTION='''id title descriptionHtml handle vendor productType status tags createdAt updatedAt seo { title description } featuredMedia { preview { image { url altText } } } images(first:50) { nodes { id url altText } } variants(first:100) { nodes { id title sku barcode } pageInfo { hasNextPage endCursor } } metafields(first:100) { nodes { id namespace key type value compareDigest description } pageInfo { hasNextPage endCursor } }'''
+PRODUCT_SELECTION='''id title descriptionHtml handle vendor productType status tags createdAt updatedAt seo { title description } featuredMedia { preview { image { url altText } } } images(first:50) { nodes { id url altText } } variants(first:100) { nodes { id title sku barcode position selectedOptions { name value } } pageInfo { hasNextPage endCursor } } metafields(first:100) { nodes { id namespace key type value compareDigest description } pageInfo { hasNextPage endCursor } }'''
 
 def shopify_stores():
     with pool.connection() as c:
@@ -160,7 +160,7 @@ def shopify_product(store, gid, locales):
         variants=data.get('variants',{}).get('nodes',[])
         variant_page=data.get('variants',{}).get('pageInfo',{})
         while variant_page.get('hasNextPage'):
-            page_query='''query VariantPage($id:ID!,$after:String) { product(id:$id) { variants(first:100,after:$after) { nodes { id title sku barcode } pageInfo { hasNextPage endCursor } } } }'''
+            page_query='''query VariantPage($id:ID!,$after:String) { product(id:$id) { variants(first:100,after:$after) { nodes { id title sku barcode position selectedOptions { name value } } pageInfo { hasNextPage endCursor } } } }'''
             page_data=shopify_graphql(store['domain'],store['token'],page_query,{'id':gid,'after':variant_page.get('endCursor')}).get('product') or {}
             connection=page_data.get('variants',{}); variants.extend(connection.get('nodes',[])); variant_page=connection.get('pageInfo',{})
             if not variant_page.get('endCursor') and variant_page.get('hasNextPage'): raise HTTPException(502,'Shopify no devolvió el cursor de variantes')
@@ -520,6 +520,7 @@ def _compare_shopify_product(source_id:str,target_store:str|None=None,target_loc
     source_base={'title':source.get('title',''),'descriptionHtml':source.get('descriptionHtml',''),'handle':source.get('handle',''),'vendor':source.get('vendor',''),'productType':source.get('productType',''),'status':source.get('status',''),'tags':', '.join(source.get('tags') or []),'createdAt':source.get('createdAt',''),'updatedAt':source.get('updatedAt',''),'seo.title':(source.get('seo') or {}).get('title',''),'seo.description':(source.get('seo') or {}).get('description',''),'variants.sku':', '.join(v.get('sku','') for v in source_variants if v.get('sku')),'variants.barcode':', '.join(v.get('barcode','') for v in source_variants if v.get('barcode')),'variants.title':', '.join(v.get('title','') for v in source_variants),'images.altText':', '.join(i.get('altText') or '' for i in source.get('images',{}).get('nodes',[]))}
     keymap={'title':'title','descriptionHtml':'body_html','handle':'handle','vendor':'vendor','productType':'product_type','status':'status','tags':'tags','createdAt':'created_at','updatedAt':'updated_at','seo.title':'seo_title','seo.description':'seo_description','variants.sku':'sku','variants.barcode':'barcode','variants.title':'variant_title','images.altText':'image_alt_text'}
     fields=[]
+    variant_mapping_errors=[]
     for key,val in source_base.items():
         values=[val]
         edits=[None]
@@ -573,8 +574,22 @@ def _compare_shopify_product(source_id:str,target_store:str|None=None,target_loc
                     values.append('')
                     edits.append(None)
                     continue
-                dest_variant=next((v for v in (target['product'] or {}).get('variants',{}).get('nodes',[]) if (v.get('sku') or v.get('title') or v['id'])==identity),None)
+                target_variants=(target['product'] or {}).get('variants',{}).get('nodes',[])
+                # Match across shops by SKU first, then by the selected option values
+                # and position. Variant titles can be translated, so they are not a
+                # reliable cross-store identity.
+                source_options=tuple((item.get('name',''),item.get('value','')) for item in source_variant.get('selectedOptions',[]))
+                dest_variant=next((v for v in target_variants if source_variant.get('sku') and v.get('sku') and v['sku'].strip().casefold()==source_variant['sku'].strip().casefold()),None)
+                if dest_variant is None and source_options:
+                    dest_variant=next((v for v in target_variants if tuple((item.get('name',''),item.get('value','')) for item in v.get('selectedOptions',[]))==source_options),None)
+                if dest_variant is None and source_variant.get('position') is not None:
+                    dest_variant=next((v for v in target_variants if v.get('position')==source_variant.get('position')),None)
+                if dest_variant is None and target['domain']==source_store['domain']:
+                    dest_variant=next((v for v in target_variants if v.get('id')==source_variant.get('id')),None)
                 dest_mf=next((item for item in (dest_variant or {}).get('metafields',{}).get('nodes',[]) if item['namespace']==namespace and item['key']==mfkey and not is_yotpo(item)),None)
+                if target['mode']!='readonly' and (dest_variant is None or dest_mf is None):
+                    reason='No se encontró la variante equivalente en destino' if dest_variant is None else 'La variante de destino no tiene este metacampo'
+                    variant_mapping_errors.append({'store':target['store'],'locale':target['locale'],'field_key':key,'field_label':f'Variante · {identity_label} · {namespace} / {mfkey}','error':reason})
                 raw_mf_value=mf_value_raw(dest_mf,target['lookup_locale'] if target['mode']=='translation' else None) if dest_mf else None
                 values.append(mf_value(dest_mf,target['product'],target['lookup_locale'] if target['mode']=='translation' else None))
                 edits.append({'store':target['store'],'resource_id':dest_mf['id'],'owner_id':dest_variant['id'] if dest_variant else '', 'source_product_gid':source_id,'locale':target['lookup_locale'],'key':'value','value':raw_mf_value,'source_value':mf_value_raw(mf),'namespace':namespace,'metafield_key':mfkey,'metafield_type':dest_mf.get('type'),'compare_digest':dest_mf.get('compareDigest'),'mode':target['mode']} if dest_mf and target['mode']!='readonly' and dest_mf.get('type') in {'single_line_text_field','multi_line_text_field','rich_text_field','html','list.single_line_text_field','list.multi_line_text_field'} else None)
@@ -607,7 +622,7 @@ def _compare_shopify_product(source_id:str,target_store:str|None=None,target_loc
     if not sku: notices.append('El producto de ES no tiene SKU; no se pudo proponer una correspondencia automática en otras tiendas.')
     for t in targets:
         if not t['product']: notices.append(f'{t["store"]} · {t["locale"]}: no hay producto equivalente localizado por correspondencia o SKU.')
-    return {'source':{'id':source['id'],'title':source['title'],'sku':sku},'columns':columns,'fields':fields,'notices':list(dict.fromkeys(notices))}
+    return {'source':{'id':source['id'],'title':source['title'],'sku':sku},'columns':columns,'fields':fields,'notices':list(dict.fromkeys(notices)),'variant_mapping_errors':variant_mapping_errors}
 
 def remember_manual_correction(x:CellTranslation):
     src=(x.source_value or '').strip()
@@ -667,7 +682,6 @@ def translate_cell(x:CellTranslateRequest,user=Depends(operator)):
               ORDER BY lower(source_term),specificity DESC,updated_at DESC
             ) preferred_terms ORDER BY length(source_term) DESC""",
             (x.source_store,x.target_store,x.source_locale,x.target_locale,x.source_store,x.target_store,x.source_locale,x.target_locale)).fetchall()
-    if exact: return {'translation':exact[0],'memory_hit':True}
     # Keep approved terms intact across DeepL without exposing a glossary or API key
     # to the browser. Replace only text nodes when the value contains HTML.
     import html as html_module
@@ -694,6 +708,9 @@ def translate_cell(x:CellTranslateRequest,user=Depends(operator)):
             segment=pattern.sub(protect,segment)
         segments[i]=segment
     protected=''.join(segments)
+    # A saved translation may predate a glossary rule. Reuse memory only when
+    # this source text contains no term that the current scoped glossary protects.
+    if exact and not tokens: return {'translation':exact[0],'memory_hit':True,'glossary_terms':0}
     try:
         from .worker import deepl_translate
         translated=deepl_translate([protected],x.target_locale,handle_html=x.html)[0]
@@ -875,6 +892,13 @@ def create_translation_batch(x:TranslationBatchRequest,user=Depends(operator)):
                 c.execute('''INSERT INTO translation_batch_items(batch_id,store_code,locale,field_key,field_label,source_text,proposed_text,edit_payload,state,error,quality)
                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(batch_id,store_code,locale,field_key) DO NOTHING''',
                   (batch_id,store_code,locale,field['key'],field['label'],source_text,proposed,Jsonb(edit),state,error,Jsonb(quality) if quality else None))
+            target_items+=1
+        for missing in comparison.get('variant_mapping_errors',[]):
+            if missing['store']!=store_code or missing['locale']!=locale: continue
+            with pool.connection() as c:
+                c.execute('''INSERT INTO translation_batch_items(batch_id,store_code,locale,field_key,field_label,state,error)
+                  VALUES(%s,%s,%s,%s,%s,'ERROR',%s) ON CONFLICT(batch_id,store_code,locale,field_key) DO NOTHING''',
+                  (batch_id,store_code,locale,missing['field_key'],missing['field_label'],missing['error']))
             target_items+=1
         if target_items==0:
             with pool.connection() as c:

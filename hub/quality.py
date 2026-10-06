@@ -56,9 +56,10 @@ def assess_translation(source, proposal, *, is_html=False):
 
     missing_numbers = _numbers(source) - _numbers(proposal)
     if missing_numbers:
-        hard_failures.append("Faltan cifras o unidades: " + ", ".join(sorted(missing_numbers.elements())))
+        missing_labels = [f"{number}{(' ' + unit) if unit else ''}" for number, unit in missing_numbers.elements()]
+        hard_failures.append("Faltan cifras o unidades: " + ", ".join(sorted(missing_labels)))
     checks.append({"name": "numbers_preserved", "passed": not missing_numbers,
-                   "missing": sorted(missing_numbers.elements())})
+                   "missing": sorted(missing_labels) if missing_numbers else []})
 
     missing_placeholders = _placeholders(source) - _placeholders(proposal)
     if missing_placeholders:

@@ -34,19 +34,28 @@ def deepl_translate(values, locale, handle_html=False):
     payload={'text':values,'target_lang':locale.upper(),'preserve_formatting':True}
     if handle_html:
         payload.update({'tag_handling':'html','tag_handling_version':'v2'})
-    request=urllib.request.Request(host+'/v2/translate',data=json.dumps(payload,ensure_ascii=False).encode(),headers={'Authorization':'DeepL-Auth-Key '+key,'Content-Type':'application/json'},method='POST')
-    try:
-        with urllib.request.urlopen(request,timeout=int(os.getenv('DEEPL_TIMEOUT_SEC','60'))) as response:
-            translations=json.loads(response.read())['translations']
-    except urllib.error.HTTPError as exc:
-        code=exc.code
-        detail=exc.read(1000).decode('utf-8','replace')
-        if code==456: prefix='DEEPL_QUOTA:'
-        elif code in (401,403): prefix='DEEPL_AUTH:'
-        else: prefix='DEEPL_ERROR:'
-        raise RuntimeError(f'{prefix} HTTP {code}: {detail}') from exc
-    except (urllib.error.URLError,TimeoutError) as exc:
-        raise RuntimeError(f'DEEPL_ERROR: fallo de conexión: {type(exc).__name__}') from exc
+    request_data=json.dumps(payload,ensure_ascii=False).encode()
+    for attempt in range(5):
+        request=urllib.request.Request(host+'/v2/translate',data=request_data,headers={'Authorization':'DeepL-Auth-Key '+key,'Content-Type':'application/json'},method='POST')
+        try:
+            with urllib.request.urlopen(request,timeout=int(os.getenv('DEEPL_TIMEOUT_SEC','60'))) as response:
+                translations=json.loads(response.read())['translations']
+            break
+        except urllib.error.HTTPError as exc:
+            code=exc.code
+            detail=exc.read(1000).decode('utf-8','replace')
+            if code==429 and attempt<4:
+                try: delay=float(exc.headers.get('Retry-After',''))
+                except (TypeError,ValueError): delay=0
+                time.sleep(min(max(delay,1*(2**attempt)),30))
+                continue
+            if code==456: prefix='DEEPL_QUOTA:'
+            elif code in (401,403): prefix='DEEPL_AUTH:'
+            elif code==429: prefix='DEEPL_RATE_LIMIT:'
+            else: prefix='DEEPL_ERROR:'
+            raise RuntimeError(f'{prefix} HTTP {code}: {detail}') from exc
+        except (urllib.error.URLError,TimeoutError) as exc:
+            raise RuntimeError(f'DEEPL_ERROR: fallo de conexión: {type(exc).__name__}') from exc
     if len(translations)!=len(values): raise RuntimeError('DEEPL_ERROR: número de traducciones inesperado')
     return [item['text'] for item in translations]
 
