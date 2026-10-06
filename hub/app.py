@@ -52,6 +52,8 @@ class GlossaryTerm(BaseModel):
     source_term:str=Field(min_length=1,max_length=500)
     target_term:str=Field(min_length=1,max_length=500)
     enabled:bool=True
+class CandidateDecision(BaseModel):
+    target_term:str=Field(min_length=1,max_length=500)
 class CellTranslateRequest(BaseModel):
     source_text:str=Field(min_length=1,max_length=120000)
     source_store:str=Field(default='ES',min_length=2,max_length=12)
@@ -252,7 +254,7 @@ document.querySelector('#store-form').addEventListener('submit',async e=>{e.prev
 
 @app.get('/glossary',response_class=HTMLResponse)
 def glossary_page():
-    body='''<main class="wrap"><h1>Glosario y aprendizaje</h1><p class="lede">Las reglas se limitan a una tienda origen, su locale y una tienda destino. El locale principal de Shopify queda seleccionado por defecto; puedes elegir otro locale publicado.</p><section class="card"><h2>Añadir término</h2><form id="term-form"><div class="grid"><div class="field"><label for="source-store">Tienda origen</label><select id="source-store" name="source_store" required></select></div><div class="field"><label for="source-locale">Idioma origen</label><select id="source-locale" name="source_locale" required disabled><option value="">Elige una tienda</option></select></div><div class="field"><label for="target-store">Tienda destino</label><select id="target-store" name="target_store" required></select></div><div class="field"><label for="target-locale">Idioma destino</label><select id="target-locale" name="target_locale" required disabled><option value="">Elige una tienda</option></select></div><div class="field"><label for="source-term">Término origen</label><input id="source-term" name="source_term" required></div><div class="field"><label for="target-term">Traducción preferida</label><input id="target-term" name="target_term" required></div></div><p id="locale-status" class="muted" role="status"></p><button id="save-term">Guardar término</button> <span id="term-status" class="status" role="status"></span></form></section><section class="card"><h2>Términos guardados</h2><div id="terms" tabindex="0" role="region" aria-label="Términos guardados">Cargando…</div></section></main><script>
+    body='''<main class="wrap"><h1>Glosario y aprendizaje</h1><p class="lede">Las reglas se limitan a una tienda origen, su locale y una tienda destino. El locale principal de Shopify queda seleccionado por defecto; puedes elegir otro locale publicado.</p><p><a class="button secondary" href="/glossary/review">Revisar candidatos del catálogo</a></p><section class="card"><h2>Añadir término</h2><form id="term-form"><div class="grid"><div class="field"><label for="source-store">Tienda origen</label><select id="source-store" name="source_store" required></select></div><div class="field"><label for="source-locale">Idioma origen</label><select id="source-locale" name="source_locale" required disabled><option value="">Elige una tienda</option></select></div><div class="field"><label for="target-store">Tienda destino</label><select id="target-store" name="target_store" required></select></div><div class="field"><label for="target-locale">Idioma destino</label><select id="target-locale" name="target_locale" required disabled><option value="">Elige una tienda</option></select></div><div class="field"><label for="source-term">Término origen</label><input id="source-term" name="source_term" required></div><div class="field"><label for="target-term">Traducción preferida</label><input id="target-term" name="target_term" required></div></div><p id="locale-status" class="muted" role="status"></p><button id="save-term">Guardar término</button> <span id="term-status" class="status" role="status"></span></form></section><section class="card"><h2>Términos guardados</h2><div id="terms" tabindex="0" role="region" aria-label="Términos guardados">Cargando…</div></section></main><script>
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));let stores=[];
 const sourceStore=document.querySelector('#source-store'),targetStore=document.querySelector('#target-store'),sourceLocale=document.querySelector('#source-locale'),targetLocale=document.querySelector('#target-locale'),localeStatus=document.querySelector('#locale-status');
 async function loadStores(){const r=await fetch('/api/stores'),data=await r.json();stores=data.filter(s=>s.active);const options=stores.map(s=>`<option value="${esc(s.code)}">${esc(s.code)} · ${esc(s.domain)}</option>`).join('');sourceStore.innerHTML=options;targetStore.innerHTML=options;await Promise.all([loadLocales(sourceStore.value,sourceLocale),loadLocales(targetStore.value,targetLocale)]);}
@@ -263,6 +265,87 @@ async function removeTerm(id){const r=await fetch('/api/glossary/'+id,{method:'D
 document.querySelector('#term-form').addEventListener('submit',async e=>{e.preventDefault();const save=document.querySelector('#save-term');save.disabled=true;const data=Object.fromEntries(new FormData(e.target));const r=await fetch('/api/glossary',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});let result={};try{result=await r.json()}catch{}document.querySelector('#term-status').textContent=r.ok?'Guardado':(result.detail||'No se pudo guardar');save.disabled=false;if(r.ok){document.querySelector('#source-term').value='';document.querySelector('#target-term').value='';loadTerms()}});loadStores();loadTerms();
 </script>'''
     return shell('Glosario',body,'glossary')
+
+@app.get('/glossary/review',response_class=HTMLResponse)
+def glossary_review_page():
+    body="""<main class="wrap"><h1>Revisión de candidatos de glosario</h1><p class="lede">Términos propuestos a partir del catálogo ya traducido. Elige el valor canónico de cada tienda (puedes escribir otro o tomar una alternativa) y apruébalo para que se aplique en las traducciones. Nada se aplica hasta aprobarlo.</p><section class="card"><form id="filters"><div class="grid"><div class="field"><label for="f-store">Tienda destino</label><select id="f-store"></select></div><div class="field"><label for="f-status">Estado</label><select id="f-status"><option value="pending">Pendientes</option><option value="approved">Aprobados</option><option value="rejected">Rechazados</option><option value="">Todos</option></select></div><div class="field"><label for="f-kind">Tipo</label><select id="f-kind"><option value="">Todos</option><option value="term">Traducciones</option><option value="invariant">No traducir (nombres, modelos)</option></select></div><div class="field"><label for="f-conflicts">Inconsistencias</label><select id="f-conflicts"><option value="">Todas</option><option value="1">Solo con alternativas</option></select></div></div></form><p id="summary" class="muted" role="status"></p></section><section class="card"><div id="candidates" tabindex="0" role="region" aria-label="Candidatos de glosario">Cargando…</div></section></main><script>
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+const box=document.querySelector('#candidates'),summary=document.querySelector('#summary'),ids=['#f-store','#f-status','#f-kind','#f-conflicts'];
+const badge={pending:'Pendiente',approved:'Aprobado',rejected:'Rechazado'};
+async function load(){const q=new URLSearchParams();const v=id=>document.querySelector(id).value;if(v('#f-store'))q.set('store',v('#f-store'));if(v('#f-status'))q.set('status',v('#f-status'));if(v('#f-kind'))q.set('kind',v('#f-kind'));if(v('#f-conflicts'))q.set('conflicts','1');
+ let d;try{const r=await fetch('/api/glossary-candidates?'+q);d=await r.json();if(!r.ok)throw new Error(d.detail||'No se pudieron cargar los candidatos')}catch(e){box.textContent=e.message;return}
+ const sel=document.querySelector('#f-store');if(sel.dataset.ready!=='1'){sel.innerHTML='<option value="">Todas</option>'+d.stores.map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join('');sel.dataset.ready='1'}
+ summary.textContent=d.candidates.length+' candidatos · '+Object.entries(d.counts).map(([k,n])=>(badge[k]||k)+': '+n).join(' · ');
+ if(!d.candidates.length){box.innerHTML='<p class="muted">No hay candidatos con estos filtros.</p>';return}
+ box.innerHTML='<table><tr><th>Tienda · idioma</th><th>Término ES</th><th>Valor canónico</th><th>Alternativas detectadas</th><th>Evidencia</th><th>Estado</th><th>Acciones</th></tr>'+d.candidates.map(c=>{
+  const alts=[{term:c.original_term,support:c.support,dice:c.dice,main:true},...c.alternatives.map(a=>({term:a.term,support:a.support,dice:a.dice}))];
+  const locked=c.status!=='pending';
+  return `<tr data-id="${c.id}"><td>${esc(c.target_store)} · ${esc(c.target_locale)}</td><td><strong>${esc(c.source_term)}</strong>${c.kind==='invariant'?'<br><span class="badge">No traducir</span>':''}</td><td><input class="canon" value="${esc(c.target_term)}" aria-label="Valor canónico de ${esc(c.source_term)}" ${locked?'disabled':''}>${c.existing&&c.existing!==c.target_term?`<br><small class="muted">En glosario: ${esc(c.existing)}</small>`:''}</td><td>${locked?'':alts.map(a=>`<button type="button" class="secondary pick" data-term="${esc(a.term)}" title="${a.support} productos · afinidad ${a.dice}">${esc(a.term)} <small>(${a.support})</small></button>`).join(' ')}</td><td>${c.support} de ${c.source_products} productos<br><small class="muted">afinidad ${c.dice}</small></td><td><span class="badge">${esc(badge[c.status]||c.status)}</span></td><td class="actions">${c.status==='pending'?'<button type="button" class="approve">Aprobar</button> <button type="button" class="secondary reject">Rechazar</button>':'<button type="button" class="secondary reopen">Reabrir</button>'}<span class="status" role="status"></span></td></tr>`}).join('')+'</table>'}
+box.addEventListener('click',async e=>{const row=e.target.closest('tr[data-id]');if(!row)return;const status=row.querySelector('.status'),input=row.querySelector('.canon');
+ const pick=e.target.closest('.pick');if(pick){input.value=pick.dataset.term;return}
+ const action=['approve','reject','reopen'].find(a=>e.target.classList.contains(a));if(!action)return;
+ const button=e.target;button.disabled=true;status.textContent='';
+ try{const r=await fetch(`/api/glossary-candidates/${row.dataset.id}/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target_term:input.value.trim()||'-'})});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||'No se pudo guardar');load()}catch(err){status.textContent=err.message;button.disabled=false}});
+for(const id of ids)document.querySelector(id).addEventListener('change',load);load();
+</script>"""
+    return shell('Revisión de glosario',body,'glossary')
+
+@app.get('/api/glossary-candidates')
+def list_glossary_candidates(store:str|None=None,status:str|None=None,kind:str|None=None,conflicts:str|None=None,user=Depends(operator)):
+    where=[]; params=[]
+    if store: where.append('c.target_store=%s'); params.append(store)
+    if status: where.append('c.status=%s'); params.append(status)
+    if kind: where.append('c.kind=%s'); params.append(kind)
+    if conflicts: where.append("jsonb_array_length(c.alternatives)>0")
+    clause=('WHERE '+' AND '.join(where)) if where else ''
+    with pool.connection() as c:
+        rows=c.execute(f"""SELECT c.id,c.target_store,c.target_locale,c.source_term,c.target_term,c.kind,c.support,c.source_products,c.dice,c.alternatives,c.status,
+              (SELECT g.target_term FROM translation_glossary g WHERE g.source_store='ES' AND g.target_store=c.target_store AND lower(g.target_locale)=lower(c.target_locale)
+                 AND lower(g.source_term)=lower(c.source_term) AND g.enabled LIMIT 1)
+            FROM glossary_candidates c {clause}
+            ORDER BY (jsonb_array_length(c.alternatives)>0) DESC,c.support DESC,c.id LIMIT 500""",params).fetchall()
+        stores=[r[0] for r in c.execute('SELECT DISTINCT target_store FROM glossary_candidates ORDER BY 1').fetchall()]
+        counts=dict(c.execute('SELECT status,count(*) FROM glossary_candidates'+(' WHERE target_store=%s' if store else '')+' GROUP BY status',[store] if store else []).fetchall())
+    keys=('id','target_store','target_locale','source_term','target_term','kind','support','source_products','dice','alternatives','status','existing')
+    out=[dict(zip(keys,r)) for r in rows]
+    for item in out: item['original_term']=item['target_term']
+    return {'candidates':out,'stores':stores,'counts':counts}
+
+def _candidate_or_404(c,candidate_id):
+    row=c.execute('SELECT id,target_store,target_locale,source_term,target_term,status FROM glossary_candidates WHERE id=%s FOR UPDATE',(candidate_id,)).fetchone()
+    if not row: raise HTTPException(404,'Candidato no encontrado')
+    return row
+
+@app.post('/api/glossary-candidates/{candidate_id}/approve')
+def approve_glossary_candidate(candidate_id:int,x:CandidateDecision,user=Depends(operator)):
+    term=x.target_term.strip()
+    if not term: raise HTTPException(400,'Indica el valor canónico')
+    with pool.connection() as c:
+        _,store,locale,source_term,_,status=_candidate_or_404(c,candidate_id)
+        c.execute("""INSERT INTO translation_glossary(source_store,source_locale,target_store,target_locale,source_term,target_term,enabled,origin)
+          VALUES('ES','es-ES',%s,%s,%s,%s,true,'historical_review')
+          ON CONFLICT (source_store,source_locale,target_store,target_locale,(lower(source_term)))
+          WHERE source_store IS NOT NULL AND target_store IS NOT NULL
+          DO UPDATE SET target_term=EXCLUDED.target_term,enabled=true,origin=EXCLUDED.origin,updated_at=now()""",(store,locale,source_term,term))
+        c.execute("UPDATE glossary_candidates SET status='approved',target_term=%s WHERE id=%s",(term,candidate_id))
+    return {'approved':True}
+
+@app.post('/api/glossary-candidates/{candidate_id}/reject')
+def reject_glossary_candidate(candidate_id:int,x:CandidateDecision|None=None,user=Depends(operator)):
+    with pool.connection() as c:
+        _candidate_or_404(c,candidate_id)
+        c.execute("UPDATE glossary_candidates SET status='rejected' WHERE id=%s",(candidate_id,))
+    return {'rejected':True}
+
+@app.post('/api/glossary-candidates/{candidate_id}/reopen')
+def reopen_glossary_candidate(candidate_id:int,x:CandidateDecision|None=None,user=Depends(operator)):
+    with pool.connection() as c:
+        _,store,locale,source_term,_,status=_candidate_or_404(c,candidate_id)
+        # Solo retira la regla que creó esta revisión; los términos manuales no se tocan.
+        if status=='approved':
+            c.execute("DELETE FROM translation_glossary WHERE source_store='ES' AND target_store=%s AND target_locale=%s AND lower(source_term)=lower(%s) AND origin='historical_review'",(store,locale,source_term))
+        c.execute("UPDATE glossary_candidates SET status='pending' WHERE id=%s",(candidate_id,))
+    return {'reopened':True}
 
 @app.get('/api/stores')
 def list_stores():
@@ -709,7 +792,7 @@ def translate_cell(x:CellTranslateRequest,user=Depends(operator)):
     for i,segment in enumerate(segments):
         if segment.startswith('<') and segment.endswith('>'): continue
         for n,(source_term,target_term) in enumerate(terms):
-            pattern=re.compile(re.escape(source_term),re.IGNORECASE)
+            pattern=re.compile(r'(?<!\w)'+re.escape(source_term)+r'(?!\w)',re.IGNORECASE)
             def protect(match):
                 nonlocal token_index
                 marker=f'ZXQGLOSSARY{token_index:06d}QXZ'
