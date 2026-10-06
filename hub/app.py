@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from psycopg.types.json import Jsonb
 from .db import pool, initialize
+from .quality import assess_translation
 
 def operator():
     # This service is intended to be reachable only on the trusted local network.
@@ -370,8 +371,8 @@ const list=document.querySelector('#batch-list'),listStatus=document.querySelect
 async function request(url,options){const r=await fetch(url,options);let d={};try{d=await r.json()}catch{}if(!r.ok)throw new Error(d.detail||'No se pudo completar la solicitud');return d}
 const date=s=>s?new Date(s).toLocaleString('es-ES'):'—';
 async function loadBatches(){listStatus.textContent='Cargando lotes…';try{const d=await request('/api/translation-batches');listStatus.textContent=d.length?d.length+' lote(s) recientes.':'No hay lotes persistidos.';list.innerHTML=d.length?'<table><thead><tr><th>ID</th><th>SKU</th><th>Producto</th><th>Estado</th><th>Actualizado</th><th></th></tr></thead><tbody>'+d.map(b=>`<tr><td>${b.id}</td><td>${esc(b.sku)}</td><td>${esc(b.source_title||'—')}</td><td>${esc(b.state)}</td><td>${esc(date(b.updated_at))}</td><td><button class="secondary open-batch" data-id="${b.id}" type="button">Revisar</button></td></tr>`).join('')+'</tbody></table>':'';list.querySelectorAll('.open-batch').forEach(b=>b.addEventListener('click',()=>loadDetail(Number(b.dataset.id))))}catch(e){listStatus.textContent=e.message}}
-function itemStatus(i){return i.state==='PENDING_REVIEW'?'Pendiente de revisión':i.state==='APPROVED'?'Aprobado · pendiente de aplicar':i.state==='SAVED'?'Aplicado en Shopify':i.state==='APPLY_ERROR'?'Error al aplicar':i.state==='ERROR'?'Error de preparación':i.state}
-function renderBatch(b){current=b;const pending=b.items.filter(i=>i.state==='PENDING_REVIEW'),approved=b.items.filter(i=>i.state==='APPROVED');detail.innerHTML=`<section class="card"><span class="badge">${esc(b.state)}</span><h2>Lote #${b.id} · ${esc(b.sku)}</h2><p>${esc(b.source_title||'')} · Creado ${esc(date(b.created_at))}</p>${b.error?`<p class="status">${esc(b.error)}</p>`:''}<div class="actions"><button id="approve-selected" type="button" ${pending.length?'':'disabled'}>Aprobar seleccionados (${pending.length})</button><button id="apply-approved" type="button" class="secondary" ${approved.length?'':'disabled'}>Aplicar aprobados a Shopify (${approved.length})</button></div><p class="muted">Aprobar registra la decisión humana. Aplicar es una acción independiente que escribe en Shopify.</p>${b.items.length?b.items.map(i=>`<article class="candidate"><div class="section-heading"><strong>${esc(i.field_label||i.field_key)}</strong><span class="badge">${esc(itemStatus(i))}</span></div><p class="muted">${esc(i.store)} · ${esc(i.locale)} · ${esc(i.field_key)}</p>${i.source_text!=null?`<details><summary>Ver texto de origen</summary><pre style="white-space:pre-wrap">${esc(i.source_text)}</pre></details>`:''}${i.state==='PENDING_REVIEW'?`<label>Propuesta<textarea class="batch-proposal" data-item="${i.id}" style="width:100%;min-height:${i.field_key==='descriptionHtml'?'140px':'72px'}">${esc(i.proposed_text||'')}</textarea></label><div class="actions"><button class="secondary save-proposal" data-item="${i.id}" type="button">Guardar edición</button><label><input class="approve-check" type="checkbox" value="${i.id}"> He revisado y apruebo este campo</label></div>`:`${i.proposed_text!=null?`<details><summary>Ver propuesta</summary><pre style="white-space:pre-wrap">${esc(i.proposed_text)}</pre></details>`:''}`}${i.error?`<p class="status">${esc(i.error)}</p>`:''}</article>`).join(''):'<p class="muted">El lote no contiene campos.</p>'}</section>`;
+function itemStatus(i){return i.state==='PENDING_REVIEW'?'Pendiente de revisión':i.state==='APPROVED'?(i.quality?.status==='PASS'?'Aprobado automáticamente · pendiente de aplicar':'Aprobado · pendiente de aplicar'):i.state==='SAVED'?'Aplicado en Shopify':i.state==='APPLY_ERROR'?'Error al aplicar':i.state==='ERROR'?'Error de preparación':i.state}
+function renderBatch(b){current=b;const pending=b.items.filter(i=>i.state==='PENDING_REVIEW'),approved=b.items.filter(i=>i.state==='APPROVED');detail.innerHTML=`<section class="card"><span class="badge">${esc(b.state)}</span><h2>Lote #${b.id} · ${esc(b.sku)}</h2><p>${esc(b.source_title||'')} · Creado ${esc(date(b.created_at))}</p>${b.error?`<p class="status">${esc(b.error)}</p>`:''}<div class="actions"><button id="approve-selected" type="button" ${pending.length?'':'disabled'}>Aprobar seleccionados (${pending.length})</button><button id="apply-approved" type="button" class="secondary" ${approved.length?'':'disabled'}>Aplicar aprobados a Shopify (${approved.length})</button></div><p class="muted">La puerta automática evalúa integridad estructural. Aplicar sigue siendo una acción independiente que escribe en Shopify.</p>${b.items.length?b.items.map(i=>`<article class="candidate"><div class="section-heading"><strong>${esc(i.field_label||i.field_key)}</strong><span class="badge">${esc(itemStatus(i))}</span></div><p class="muted">${esc(i.store)} · ${esc(i.locale)} · ${esc(i.field_key)}</p>${i.quality?`<p class="muted">Calidad ${esc(i.quality.status)} · ${esc(i.quality.score)}/100 (umbral ${esc(i.quality.threshold)})${i.quality.hard_failures?.length?` · ${esc(i.quality.hard_failures.join('; '))}`:''}</p>`:''}${i.source_text!=null?`<details><summary>Ver texto de origen</summary><pre style="white-space:pre-wrap">${esc(i.source_text)}</pre></details>`:''}${i.state==='PENDING_REVIEW'?`<label>Propuesta<textarea class="batch-proposal" data-item="${i.id}" style="width:100%;min-height:${i.field_key==='descriptionHtml'?'140px':'72px'}">${esc(i.proposed_text||'')}</textarea></label><div class="actions"><button class="secondary save-proposal" data-item="${i.id}" type="button">Guardar edición</button><label><input class="approve-check" type="checkbox" value="${i.id}"> He revisado y apruebo este campo</label></div>`:`${i.proposed_text!=null?`<details><summary>Ver propuesta</summary><pre style="white-space:pre-wrap">${esc(i.proposed_text)}</pre></details>`:''}`}${i.error?`<p class="status">${esc(i.error)}</p>`:''}</article>`).join(''):'<p class="muted">El lote no contiene campos.</p>'}</section>`;
 detail.querySelectorAll('.save-proposal').forEach(btn=>btn.addEventListener('click',async()=>{const id=Number(btn.dataset.item),text=detail.querySelector(`.batch-proposal[data-item="${id}"]`).value;btn.disabled=true;try{await request(`/api/translation-batches/${b.id}/items/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({proposed_text:text})});await loadDetail(b.id)}catch(e){alert(e.message);btn.disabled=false}}));
 detail.querySelector('#approve-selected')?.addEventListener('click',async()=>{const ids=[...detail.querySelectorAll('.approve-check:checked')].map(x=>Number(x.value));if(!ids.length)return;const button=detail.querySelector('#approve-selected');button.disabled=true;try{await request(`/api/translation-batches/${b.id}/approve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({item_ids:ids})});await loadDetail(b.id);await loadBatches()}catch(e){alert(e.message);button.disabled=false}});
 detail.querySelector('#apply-approved')?.addEventListener('click',async()=>{if(!confirm(`¿Aplicar ${approved.length} campo(s) aprobado(s) a Shopify?`))return;const button=detail.querySelector('#apply-approved');button.disabled=true;try{await request(`/api/translation-batches/${b.id}/apply`,{method:'POST'});await loadDetail(b.id);await loadBatches()}catch(e){alert(e.message);button.disabled=false}})}
@@ -807,9 +808,9 @@ def translation_batch_payload(batch_id:int):
     with pool.connection() as c:
         batch=c.execute('SELECT id,source_sku,source_product_gid,source_title,state,error,created_at,updated_at FROM translation_batches WHERE id=%s',(batch_id,)).fetchone()
         if not batch: raise HTTPException(404,'Lote de traducción no encontrado')
-        rows=c.execute('SELECT id,store_code,locale,field_key,field_label,source_text,proposed_text,edit_payload,state,error,created_at,updated_at FROM translation_batch_items WHERE batch_id=%s ORDER BY id',(batch_id,)).fetchall()
+        rows=c.execute('SELECT id,store_code,locale,field_key,field_label,source_text,proposed_text,edit_payload,state,error,created_at,updated_at,quality FROM translation_batch_items WHERE batch_id=%s ORDER BY id',(batch_id,)).fetchall()
     return {'id':batch[0],'sku':batch[1],'source_product_gid':batch[2],'source_title':batch[3],'state':batch[4],'error':batch[5],'created_at':batch[6],'updated_at':batch[7],
-      'items':[dict(zip(('id','store','locale','field_key','field_label','source_text','proposed_text','edit_payload','state','error','created_at','updated_at'),row)) for row in rows]}
+      'items':[dict(zip(('id','store','locale','field_key','field_label','source_text','proposed_text','edit_payload','state','error','created_at','updated_at','quality'),row)) for row in rows]}
 
 @app.get('/api/translation-batches')
 def list_translation_batches(user=Depends(operator)):
@@ -865,13 +866,15 @@ def create_translation_batch(x:TranslationBatchRequest,user=Depends(operator)):
             try:
                 request=CellTranslateRequest(source_text=source_text,source_store='ES',source_locale=source_locale,target_store=store_code,target_locale=locale,field_key=edit['key'],metafield_type=edit.get('metafield_type'),html=field['key']=='descriptionHtml' or edit.get('metafield_type')=='html')
                 translated=translate_cell(request,user)
-                proposed=translated['translation']; state='PENDING_REVIEW'; error=None
+                proposed=translated['translation']; error=None
+                quality=assess_translation(source_text,proposed,is_html=request.html)
+                state='APPROVED' if quality['status']=='PASS' and os.getenv('QUALITY_AUTO_APPROVE','true').lower() in ('1','true','yes','on') else 'PENDING_REVIEW'
             except Exception as exc:
-                proposed=None; state='ERROR'; error=str(exc.detail if isinstance(exc,HTTPException) else exc)[:500]
+                proposed=None; quality=None; state='ERROR'; error=str(exc.detail if isinstance(exc,HTTPException) else exc)[:500]
             with pool.connection() as c:
-                c.execute('''INSERT INTO translation_batch_items(batch_id,store_code,locale,field_key,field_label,source_text,proposed_text,edit_payload,state,error)
-                  VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(batch_id,store_code,locale,field_key) DO NOTHING''',
-                  (batch_id,store_code,locale,field['key'],field['label'],source_text,proposed,Jsonb(edit),state,error))
+                c.execute('''INSERT INTO translation_batch_items(batch_id,store_code,locale,field_key,field_label,source_text,proposed_text,edit_payload,state,error,quality)
+                  VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(batch_id,store_code,locale,field_key) DO NOTHING''',
+                  (batch_id,store_code,locale,field['key'],field['label'],source_text,proposed,Jsonb(edit),state,error,Jsonb(quality) if quality else None))
             target_items+=1
         if target_items==0:
             with pool.connection() as c:
@@ -879,7 +882,7 @@ def create_translation_batch(x:TranslationBatchRequest,user=Depends(operator)):
                   VALUES(%s,%s,%s,'__product__','Producto','ERROR','No se encontró un producto equivalente o campos principales editables en el destino')
                   ON CONFLICT(batch_id,store_code,locale,field_key) DO NOTHING''',(batch_id,store_code,locale))
     with pool.connection() as c:
-        c.execute("UPDATE translation_batches SET state=CASE WHEN EXISTS(SELECT 1 FROM translation_batch_items WHERE batch_id=%s AND state='PENDING_REVIEW') THEN 'PENDING_REVIEW' ELSE 'READY_WITH_ERRORS' END,updated_at=now() WHERE id=%s",(batch_id,batch_id))
+        c.execute("UPDATE translation_batches SET state=CASE WHEN EXISTS(SELECT 1 FROM translation_batch_items WHERE batch_id=%s AND state='PENDING_REVIEW') THEN 'PENDING_REVIEW' WHEN EXISTS(SELECT 1 FROM translation_batch_items WHERE batch_id=%s AND state='APPROVED') THEN 'APPROVED' ELSE 'READY_WITH_ERRORS' END,updated_at=now() WHERE id=%s",(batch_id,batch_id,batch_id))
     return translation_batch_payload(batch_id)
 
 @app.get('/api/translation-batches/{batch_id}')
@@ -889,8 +892,11 @@ def get_translation_batch(batch_id:int,user=Depends(operator)):
 @app.patch('/api/translation-batches/{batch_id}/items/{item_id}')
 def edit_translation_batch_item(batch_id:int,item_id:int,x:TranslationBatchItemEdit,user=Depends(operator)):
     with pool.connection() as c:
-        row=c.execute("UPDATE translation_batch_items SET proposed_text=%s,updated_at=now() WHERE id=%s AND batch_id=%s AND state='PENDING_REVIEW' RETURNING id",(x.proposed_text,item_id,batch_id)).fetchone()
-    if not row: raise HTTPException(409,'El campo no existe o ya no está pendiente de revisión')
+        current=c.execute("SELECT source_text,field_key,edit_payload FROM translation_batch_items WHERE id=%s AND batch_id=%s AND state='PENDING_REVIEW'",(item_id,batch_id)).fetchone()
+        if not current: raise HTTPException(409,'El campo no existe o ya no está pendiente de revisión')
+        is_html=current[1]=='descriptionHtml' or (current[2] or {}).get('metafield_type')=='html'
+        quality=assess_translation(current[0],x.proposed_text,is_html=is_html)
+        c.execute("UPDATE translation_batch_items SET proposed_text=%s,quality=%s,updated_at=now() WHERE id=%s AND batch_id=%s",(x.proposed_text,Jsonb(quality),item_id,batch_id))
     return {'batch_id':batch_id,'item_id':item_id,'updated':True}
 
 @app.post('/api/translation-batches/{batch_id}/approve')
