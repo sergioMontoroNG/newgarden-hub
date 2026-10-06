@@ -24,7 +24,7 @@ def generate(product_key,locale,source):
     if mode!='deepl': raise RuntimeError('El flujo por lotes requiere TRANSLATION_PROVIDER=deepl')
     return generate_deepl(product_key,locale,source)
 
-def deepl_translate(values, locale, handle_html=False):
+def deepl_translate(values, locale, handle_html=False, formality=None, source_lang=None):
     key=os.getenv('DEEPL_AUTH_KEY','').strip()
     if not key: raise RuntimeError('DEEPL_AUTH: falta configurar DEEPL_AUTH_KEY')
     if not values: return []
@@ -32,6 +32,8 @@ def deepl_translate(values, locale, handle_html=False):
         raise RuntimeError('Entrada DeepL supera el límite interno de 120 KiB')
     host='https://api-free.deepl.com' if key.endswith(':fx') else 'https://api.deepl.com'
     payload={'text':values,'target_lang':locale.upper(),'preserve_formatting':True}
+    if source_lang: payload['source_lang']=source_lang
+    if formality: payload['formality']=formality
     if handle_html:
         payload.update({'tag_handling':'html','tag_handling_version':'v2'})
     request_data=json.dumps(payload,ensure_ascii=False).encode()

@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from psycopg.types.json import Jsonb
 from .db import pool, initialize
 from .quality import assess_translation
+from .profiles import active_profiles, target_profile
 
 def operator():
     # This service is intended to be reachable only on the trusted local network.
@@ -273,7 +274,11 @@ def list_stores():
 def shop_locales(code:str):
     store=next((item for item in shopify_stores() if item['code']==code),None)
     if not store or not store['token']: raise HTTPException(404,'Tienda inactiva o sin credenciales Shopify')
-    locales=shopify_shop_locales(store)
+    profiles=active_profiles(code)
+    locales=[]
+    for item in shopify_shop_locales(store):
+        profile=profiles.get(item.get('locale','').lower())
+        if profile: locales.append({**item,'role':profile['role'],'deepl_target':profile['deepl_target']})
     return sorted(locales,key=lambda item:(not item.get('primary',False),item.get('locale','')))
 
 @app.get('/products',response_class=HTMLResponse)
@@ -351,7 +356,7 @@ def batch_products_page():
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const storeSelect=document.querySelector('#target-store'),localeSelect=document.querySelector('#target-locale'),status=document.querySelector('#batch-status'),results=document.querySelector('#batch-results');let activeStores=[];
 async function loadStores(){try{const r=await fetch('/api/stores'),data=await r.json();if(!r.ok)throw new Error(data.detail||'No se pudieron cargar las tiendas');activeStores=data.filter(s=>s.active&&s.has_token);storeSelect.innerHTML=data.map(s=>`<option value="${esc(s.code)}" ${!s.active||!s.has_token?'disabled':''}>${esc(s.code)} · ${esc(s.domain||'sin dominio')}${!s.active?' · inactiva':!s.has_token?' · falta token':''}</option>`).join('');if(!activeStores.length){storeSelect.disabled=true;status.textContent='Activa la tienda destino y configura su token en Tiendas para habilitarla.';return}storeSelect.value=activeStores[0].code;storeSelect.disabled=false;await loadLocales()}catch(e){storeSelect.innerHTML='<option value="">No disponible</option>';status.textContent=e.message}}
-async function loadLocales(){const code=storeSelect.value;localeSelect.disabled=true;try{const r=await fetch('/api/stores/'+encodeURIComponent(code)+'/shop-locales'),data=await r.json();if(!r.ok)throw new Error(data.detail||'No se pudieron consultar locales');const choices=data.filter(x=>x.published&&!(code==='ES'&&x.primary));localeSelect.innerHTML=choices.map(x=>`<option value="${esc(x.locale)}">${esc(x.locale)}${x.primary?' · principal':''}</option>`).join('');if(!choices.length)throw new Error('Shopify no devolvió locales publicados editables');localeSelect.disabled=false}catch(e){localeSelect.innerHTML='<option value="">No hay locales editables</option>';status.textContent=e.message}}
+async function loadLocales(){const code=storeSelect.value;localeSelect.disabled=true;try{const r=await fetch('/api/stores/'+encodeURIComponent(code)+'/shop-locales'),data=await r.json();if(!r.ok)throw new Error(data.detail||'No se pudieron consultar locales');const choices=data.filter(x=>x.published&&x.deepl_target&&!(code==='ES'&&x.primary));localeSelect.innerHTML=choices.map(x=>`<option value="${esc(x.locale)}">${esc(x.locale)}${x.primary?' · principal':''}</option>`).join('');if(!choices.length)throw new Error('Shopify no devolvió locales publicados editables');localeSelect.disabled=false}catch(e){localeSelect.innerHTML='<option value="">No hay locales editables</option>';status.textContent=e.message}}
 storeSelect.addEventListener('change',loadLocales);loadStores();
 const mainFields=new Set(['descriptionHtml','seo.title','seo.description']),textMetaTypes=new Set(['single_line_text_field','multi_line_text_field','html','rich_text_field','list.single_line_text_field','list.multi_line_text_field']);
 function note(card,message){const p=document.createElement('p');p.className='muted';p.textContent=message;card.append(p)}
@@ -633,11 +638,13 @@ def remember_manual_correction(x:CellTranslation):
     dst=x.value.strip()
     if src and dst and src!=dst and len(src)<=500 and len(dst)<=500:
         with pool.connection() as c:
-            c.execute("INSERT INTO translation_memory(source_locale,target_locale,source_text,target_text) VALUES('es-ES',%s,%s,%s) ON CONFLICT(source_locale,target_locale,source_text) DO UPDATE SET target_text=EXCLUDED.target_text,created_at=now()",(x.locale,src,dst))
+            c.execute("INSERT INTO translation_memory(target_store,source_locale,target_locale,source_text,target_text) VALUES(%s,'es-ES',%s,%s,%s) ON CONFLICT(target_store,source_locale,target_locale,source_text) WHERE target_store IS NOT NULL DO UPDATE SET target_text=EXCLUDED.target_text,created_at=now()",(x.store,x.locale,src,dst))
 
 @app.post('/api/translate-cell')
 def translate_cell(x:CellTranslateRequest,user=Depends(operator)):
     if x.field_key=='handle': raise HTTPException(400,'El handle requiere adaptación manual antes de guardarse')
+    profile=target_profile(x.target_store,x.target_locale)
+    if not profile: raise HTTPException(400,f'{x.target_store} · {x.target_locale} no tiene un perfil de traducción activo')
     if x.metafield_type in {'rich_text_field','list.single_line_text_field','list.multi_line_text_field'}:
         try: structured=json.loads(x.source_text)
         except (TypeError,json.JSONDecodeError): raise HTTPException(400,'El metacampo estructurado no contiene JSON válido')
@@ -664,15 +671,16 @@ def translate_cell(x:CellTranslateRequest,user=Depends(operator)):
             if not isinstance(structured,list) or not all(isinstance(item,str) for item in structured): raise HTTPException(400,'La lista del metacampo debe contener textos')
             structured=[translate_leaf(item) for item in structured]
         if not translated_nodes: raise HTTPException(400,'El metacampo no contiene texto traducible')
-        return {'translation':json.dumps(structured,ensure_ascii=False,separators=(',',':')),'memory_hit':memory_hits==translated_nodes,'glossary_terms':glossary_terms}
+        return {'translation':json.dumps(structured,ensure_ascii=False,separators=(',',':')),'memory_hit':memory_hits==translated_nodes,'glossary_terms':glossary_terms,'require_review':profile['require_review']}
     if not os.getenv('DEEPL_AUTH_KEY','').strip(): raise HTTPException(503,'DeepL no está configurado en el servidor')
     with pool.connection() as c:
         exact=c.execute("""SELECT target_text FROM translation_memory
-            WHERE split_part(lower(source_locale),'-',1)=split_part(lower(%s),'-',1)
+            WHERE target_store=%s
+              AND split_part(lower(source_locale),'-',1)=split_part(lower(%s),'-',1)
               AND split_part(lower(target_locale),'-',1)=split_part(lower(%s),'-',1)
               AND source_text=%s
             ORDER BY ((lower(source_locale)=lower(%s))::int + (lower(target_locale)=lower(%s))::int) DESC
-            LIMIT 1""",(x.source_locale,x.target_locale,x.source_text.strip(),x.source_locale,x.target_locale)).fetchone()
+            LIMIT 1""",(x.target_store,x.source_locale,x.target_locale,x.source_text.strip(),x.source_locale,x.target_locale)).fetchone()
         terms=c.execute("""SELECT source_term,target_term FROM (
               SELECT DISTINCT ON (lower(source_term)) source_term,target_term,
                 (((source_store=%s AND target_store=%s)::int * 2)
@@ -714,14 +722,14 @@ def translate_cell(x:CellTranslateRequest,user=Depends(operator)):
     protected=''.join(segments)
     # A saved translation may predate a glossary rule. Reuse memory only when
     # this source text contains no term that the current scoped glossary protects.
-    if exact and not tokens: return {'translation':exact[0],'memory_hit':True,'glossary_terms':0}
+    if exact and not tokens: return {'translation':exact[0],'memory_hit':True,'glossary_terms':0,'require_review':profile['require_review']}
     try:
         from .worker import deepl_translate
-        translated=deepl_translate([protected],x.target_locale,handle_html=x.html)[0]
+        translated=deepl_translate([protected],profile['deepl_target'],handle_html=x.html,formality=profile['formality'],source_lang='ES')[0]
     except RuntimeError as exc:
         raise HTTPException(502,str(exc)[:500])
     for marker,target_term in tokens.items(): translated=translated.replace(marker,target_term)
-    return {'translation':translated,'memory_hit':False,'glossary_terms':len(tokens)}
+    return {'translation':translated,'memory_hit':False,'glossary_terms':len(tokens),'require_review':profile['require_review']}
 
 @app.get('/api/glossary')
 def list_glossary(target_locale:str|None=None,user=Depends(operator)):
@@ -856,7 +864,8 @@ def create_translation_batch(x:TranslationBatchRequest,user=Depends(operator)):
         if not store['token']: continue
         try: locales=shopify_shop_locales(store)
         except HTTPException: continue
-        published=[item['locale'] for item in locales if item.get('published') and not (store['code']=='ES' and item.get('primary'))]
+        profiles=active_profiles(store['code'])
+        published=[item['locale'] for item in locales if item.get('published') and not (store['code']=='ES' and item.get('primary')) and (profiles.get(item['locale'].lower()) or {}).get('deepl_target')]
         targets.extend((store['code'],locale) for locale in published)
         if published: target_locales[store['code']]=published
     if not targets: raise HTTPException(409,'No hay locales publicados de destino en las tiendas activas')
@@ -889,7 +898,7 @@ def create_translation_batch(x:TranslationBatchRequest,user=Depends(operator)):
                 translated=translate_cell(request,user)
                 proposed=translated['translation']; error=None
                 quality=assess_translation(source_text,proposed,is_html=request.html)
-                state='APPROVED' if quality['status']=='PASS' and os.getenv('QUALITY_AUTO_APPROVE','true').lower() in ('1','true','yes','on') else 'PENDING_REVIEW'
+                state='APPROVED' if quality['status']=='PASS' and not translated.get('require_review') and os.getenv('QUALITY_AUTO_APPROVE','true').lower() in ('1','true','yes','on') else 'PENDING_REVIEW'
             except Exception as exc:
                 proposed=None; quality=None; state='ERROR'; error=str(exc.detail if isinstance(exc,HTTPException) else exc)[:500]
             with pool.connection() as c:
