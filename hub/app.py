@@ -1,11 +1,11 @@
-import hashlib, json, os, html, re
+import hashlib, json, os, html, re, time
 import urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlencode
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from psycopg.types.json import Jsonb
 from .db import pool, initialize
 from .quality import assess_translation
@@ -63,8 +63,38 @@ class CellTranslateRequest(BaseModel):
     html:bool=False
     field_key:str=Field(min_length=1,max_length=255)
     metafield_type:str|None=None
+BATCH_BASE_FIELDS={'descriptionHtml','seo.title','seo.description'}
 class TranslationBatchRequest(BaseModel):
     sku:str=Field(min_length=1,max_length=120)
+    # Optional campaign targeting. Without `fields` the batch keeps its original
+    # scope (description, SEO and every metafield). Accepted values: the base keys
+    # above, `metafields` (all of them) or `metafield:<namespace>.<key>`.
+    fields:list[str]|None=Field(default=None,min_length=1,max_length=100)
+    store:str|None=Field(default=None,pattern=r'^[A-Z0-9_-]{2,12}$')
+    locale:str|None=Field(default=None,min_length=2,max_length=20)
+
+    @field_validator('fields')
+    @classmethod
+    def check_fields(cls,value):
+        if value is None: return value
+        cleaned=[]
+        for item in value:
+            item=item.strip()
+            if item not in BATCH_BASE_FIELDS and item!='metafields' and not re.fullmatch(r'metafield:[^\s.:]{1,255}\.[^\s:]{1,255}',item):
+                raise ValueError(f'Campo no válido: {item}')
+            if item not in cleaned: cleaned.append(item)
+        return cleaned
+
+def batch_field_selected(key:str,specs:list[str]|None)->bool:
+    if specs is None: return key in BATCH_BASE_FIELDS or key.startswith('metafield.')
+    if key in specs: return True
+    if not key.startswith('metafield.'): return False
+    if 'metafields' in specs: return True
+    for spec in specs:
+        if not spec.startswith('metafield:'): continue
+        ns_key=spec[len('metafield:'):]
+        if key==f'metafield.product.{ns_key}' or (key.startswith('metafield.variant.') and key.endswith('.'+ns_key)): return True
+    return False
 class TranslationBatchItemIds(BaseModel):
     item_ids:list[int]=Field(min_length=1,max_length=500)
 class TranslationBatchItemEdit(BaseModel):
@@ -435,19 +465,18 @@ form.addEventListener('submit',async event=>{{event.preventDefault();if(!editTar
 
 @app.get('/products/batch',response_class=HTMLResponse)
 def batch_products_page():
-    body='''<main class="wrap"><h1>Traducción en lote por SKU</h1><p class="lede">El servicio procesa un producto cada vez y prepara traducciones de descripción, campos SEO y metacampos de texto. El título principal se revisa desde el editor individual. Cada propuesta queda pendiente hasta que la revises y la apruebes.</p><section class="card"><form id="batch-form"><div class="field"><label for="skus">SKU (uno por línea o separados por coma)</label><textarea id="skus" required maxlength="20000" placeholder="NG-1234&#10;NG-5678"></textarea></div><div class="grid"><div class="field"><label for="target-store">Tienda destino</label><select id="target-store" required disabled><option>Cargando tiendas…</option></select></div><div class="field"><label for="target-locale">Locale destino</label><select id="target-locale" required disabled><option>Selecciona una tienda</option></select></div></div><p id="batch-status" class="muted" role="status"></p><div class="actions"><button id="prepare-batch" type="submit">Preparar traducciones</button><button id="approve-batch" type="button" disabled>Aprobar y guardar seleccionados</button><a class="button secondary" href="/products">Volver al explorador</a></div><p class="muted">La preparación solo consulta Shopify y DeepL. Ningún cambio se guarda hasta pulsar “Aprobar y guardar seleccionados”. Máximo 50 SKU por ejecución.</p></form></section><section id="batch-results" aria-live="polite"></section></main><script>
-const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const storeSelect=document.querySelector('#target-store'),localeSelect=document.querySelector('#target-locale'),status=document.querySelector('#batch-status'),results=document.querySelector('#batch-results');let activeStores=[];
-async function loadStores(){try{const r=await fetch('/api/stores'),data=await r.json();if(!r.ok)throw new Error(data.detail||'No se pudieron cargar las tiendas');activeStores=data.filter(s=>s.active&&s.has_token);storeSelect.innerHTML=data.map(s=>`<option value="${esc(s.code)}" ${!s.active||!s.has_token?'disabled':''}>${esc(s.code)} · ${esc(s.domain||'sin dominio')}${!s.active?' · inactiva':!s.has_token?' · falta token':''}</option>`).join('');if(!activeStores.length){storeSelect.disabled=true;status.textContent='Activa la tienda destino y configura su token en Tiendas para habilitarla.';return}storeSelect.value=activeStores[0].code;storeSelect.disabled=false;await loadLocales()}catch(e){storeSelect.innerHTML='<option value="">No disponible</option>';status.textContent=e.message}}
-async function loadLocales(){const code=storeSelect.value;localeSelect.disabled=true;try{const r=await fetch('/api/stores/'+encodeURIComponent(code)+'/shop-locales'),data=await r.json();if(!r.ok)throw new Error(data.detail||'No se pudieron consultar locales');const choices=data.filter(x=>x.published&&x.deepl_target&&!(code==='ES'&&x.primary));localeSelect.innerHTML=choices.map(x=>`<option value="${esc(x.locale)}">${esc(x.locale)}${x.primary?' · principal':''}</option>`).join('');if(!choices.length)throw new Error('Shopify no devolvió locales publicados editables');localeSelect.disabled=false}catch(e){localeSelect.innerHTML='<option value="">No hay locales editables</option>';status.textContent=e.message}}
+    body='''<main class="wrap"><h1>Campaña de traducción por SKU</h1><p class="lede">Elige varios SKU y, si quieres, solo los campos que te interesan para esta campaña. El servicio prepara las propuestas de un producto cada vez y las deja en <a href="/translation-batches">Revisión de lotes</a>. Nada se escribe en Shopify hasta que alguien revise, apruebe y aplique.</p><section class="card"><form id="batch-form"><div class="field"><label for="skus">SKU (uno por línea o separados por coma)</label><textarea id="skus" required maxlength="20000" placeholder="NG-1234&#10;NG-5678"></textarea></div><div class="grid"><div class="field"><label for="target-store">Tienda destino</label><select id="target-store" disabled><option>Cargando tiendas…</option></select></div><div class="field"><label for="target-locale">Locale destino</label><select id="target-locale" disabled><option value="">Todos los locales</option></select></div></div><fieldset class="field"><legend>Campos a traducir</legend><label><input type="checkbox" class="field-choice" value="descriptionHtml" checked style="width:auto"> Descripción</label><br><label><input type="checkbox" class="field-choice" value="seo.title" checked style="width:auto"> SEO · título</label><br><label><input type="checkbox" class="field-choice" value="seo.description" checked style="width:auto"> SEO · descripción</label><br><label><input type="checkbox" class="field-choice" value="metafields" style="width:auto"> Todos los metacampos (producto y variantes)</label><div id="meta-picker" class="field"><p class="muted" id="meta-status">Cargando metacampos de ES…</p></div><details class="field"><summary>Añadir metacampos a mano</summary><label for="meta-fields">Metacampos adicionales (<code>namespace.key</code>, uno por línea)</label><textarea id="meta-fields" rows="3" maxlength="4000" placeholder="custom.ficha_tecnica"></textarea></details></fieldset><p id="batch-status" class="muted" role="status" aria-live="polite"></p><div class="actions"><button id="prepare-batch" type="submit">Preparar lotes para revisión</button><a class="button secondary" href="/products">Volver al explorador</a></div><p class="muted">La preparación consulta Shopify y DeepL y guarda los lotes en el hub; no escribe en Shopify. Máximo 50 SKU por ejecución.</p></form></section><section id="batch-results" aria-live="polite"></section></main><script>
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const storeSelect=document.querySelector('#target-store'),localeSelect=document.querySelector('#target-locale'),status=document.querySelector('#batch-status'),results=document.querySelector('#batch-results');
+async function fetchJSON(url,options){const r=await fetch(url,options);let data={};try{data=await r.json()}catch{}if(!r.ok)throw new Error(typeof data.detail==='string'?data.detail:'Error al procesar la solicitud');return data}
+async function loadStores(){try{const data=await fetchJSON('/api/stores'),usable=data.filter(s=>s.active&&s.has_token);if(!usable.length){storeSelect.innerHTML='<option value="">Sin tiendas activas</option>';status.textContent='Activa una tienda y configura su token en Tiendas para habilitarla.';return}storeSelect.innerHTML='<option value="">Todas las tiendas</option>'+usable.map(s=>`<option value="${esc(s.code)}">${esc(s.code)} · ${esc(s.domain||'sin dominio')}</option>`).join('');storeSelect.disabled=false}catch(e){storeSelect.innerHTML='<option value="">No disponible</option>';status.textContent=e.message}}
+async function loadLocales(){localeSelect.innerHTML='<option value="">Todos los locales</option>';localeSelect.disabled=true;const code=storeSelect.value;if(!code)return;try{const data=await fetchJSON('/api/stores/'+encodeURIComponent(code)+'/shop-locales');localeSelect.innerHTML='<option value="">Todos los locales</option>'+data.filter(x=>x.published&&x.deepl_target&&!(code==='ES'&&x.primary)).map(x=>`<option value="${esc(x.locale)}">${esc(x.locale)}</option>`).join('');localeSelect.disabled=false}catch(e){status.textContent=e.message}}
 storeSelect.addEventListener('change',loadLocales);loadStores();
-const mainFields=new Set(['descriptionHtml','seo.title','seo.description']),textMetaTypes=new Set(['single_line_text_field','multi_line_text_field','html','rich_text_field','list.single_line_text_field','list.multi_line_text_field']);
-function note(card,message){const p=document.createElement('p');p.className='muted';p.textContent=message;card.append(p)}
-function fieldRow(field,edit,translation){const row=document.createElement('div');row.className='candidate';const label=document.createElement('strong');label.textContent=field.label;row.append(label);const source=document.createElement('p');source.className='muted';source.textContent='Origen: '+field.values[0];row.append(source);const editor=document.createElement('textarea');editor.setAttribute('aria-label','Propuesta para '+field.label);editor.value=translation;editor.style.width='100%';editor.style.minHeight=field.key==='descriptionHtml'?'140px':'72px';row.append(editor);const check=document.createElement('label');check.style.marginTop='8px';const input=document.createElement('input');input.type='checkbox';input.className='batch-approve';input.disabled=false;input.style.width='auto';input.dataset.edit=JSON.stringify(edit);check.append(input,document.createTextNode(' He revisado y apruebo este campo para guardarlo'));row.append(check);const state=document.createElement('span');state.className='status batch-state';row.append(state);return row}
-async function fetchJSON(url,options){const r=await fetch(url,options);let data={};try{data=await r.json()}catch{}if(!r.ok)throw new Error(data.detail||'Error al procesar la solicitud');return data}
-async function prepareSku(sku,store,locale){const card=document.createElement('section');card.className='card';const heading=document.createElement('h2');heading.textContent='SKU '+sku;card.append(heading);note(card,'Buscando producto…');results.append(card);try{const found=await fetchJSON('/api/shopify/products/search?q='+encodeURIComponent(sku));const sourceCandidates=found.products.filter(p=>p.store_codes.includes('ES')).flatMap(p=>p.candidates).filter(c=>String(c.sku||'').trim().toLowerCase()===sku.toLowerCase());const unique=[...new Map(sourceCandidates.map(c=>[c.id,c])).values()];if(unique.length!==1)throw new Error(unique.length?'SKU ambiguo: se encontraron varios productos en ES':'No se encontró un producto ES con ese SKU exacto');const product=unique[0];heading.textContent=product.title+' · SKU '+sku;const comparison=await fetchJSON('/api/shopify/products/compare?source_id='+encodeURIComponent(product.id)+'&target_store='+encodeURIComponent(store)+'&target_locale='+encodeURIComponent(locale));const applicable=comparison.fields.filter(f=>mainFields.has(f.key)||(f.key.startsWith('metafield.')&&f.edits.some(edit=>edit&&textMetaTypes.has(edit.metafield_type))));let proposals=0;for(const field of applicable){const index=comparison.columns.findIndex((col,i)=>i>0&&col.label.startsWith(store+' · '+locale));if(index<1)continue;const edit=field.edits[index];const src=field.key.startsWith('metafield.')?edit?.source_value:field.values[0];if(!edit||!src){continue}try{const answer=await fetchJSON('/api/translate-cell',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_text:src,source_store:'ES',source_locale:'es-ES',target_store:store,target_locale:locale,field_key:edit.key,metafield_type:edit.metafield_type,html:field.key==='descriptionHtml'||edit.metafield_type==='html'})});const row=fieldRow(field,edit,answer.translation);card.append(row);proposals++}catch(e){note(card,field.label+': '+e.message)}}const notices=comparison.notices||[];notices.forEach(n=>note(card,n));if(!proposals)note(card,'No hay campos traducibles editables con contenido para este destino.');else note(card,proposals+' propuesta(s). Marca solo las traducciones que hayas revisado.') }catch(e){note(card,e.message)}}
-document.querySelector('#batch-form').addEventListener('submit',async e=>{e.preventDefault();const skus=[...new Set(document.querySelector('#skus').value.replaceAll(',',String.fromCharCode(10)).split(String.fromCharCode(10)).map(x=>x.trim()).filter(Boolean))];if(!skus.length)return;if(skus.length>50){status.textContent='El máximo es 50 SKU por ejecución.';return}if(!localeSelect.value){status.textContent='Selecciona un locale destino editable.';return}const run=document.querySelector('#prepare-batch');run.disabled=true;document.querySelector('#approve-batch').disabled=true;results.replaceChildren();const store=storeSelect.value,locale=localeSelect.value;status.textContent='Preparando '+skus.length+' producto(s) secuencialmente…';for(let i=0;i<skus.length;i++){status.textContent='Preparando '+(i+1)+'/'+skus.length+' · '+skus[i];await prepareSku(skus[i],store,locale)}run.disabled=false;document.querySelector('#approve-batch').disabled=!results.querySelector('.batch-approve');status.textContent='Preparación terminada. Revisa las propuestas y marca expresamente los campos que apruebas.'});
-document.querySelector('#approve-batch').addEventListener('click',async()=>{const button=document.querySelector('#approve-batch'),checks=[...results.querySelectorAll('.batch-approve:checked')];if(!checks.length){status.textContent='Marca al menos un campo que hayas revisado.';return}if(!confirm('¿Guardar en Shopify los '+checks.length+' campos marcados?'))return;button.disabled=true;let saved=0;for(const checkbox of checks){const row=checkbox.closest('.candidate'),state=row.querySelector('.batch-state'),edit=JSON.parse(checkbox.dataset.edit);state.textContent='Guardando…';try{await fetchJSON('/api/shopify/translations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...edit,value:row.querySelector('textarea').value})});checkbox.checked=false;checkbox.disabled=true;state.textContent='Guardado';saved++}catch(e){state.textContent=e.message}}button.disabled=false;status.textContent=saved+' campo(s) guardado(s) en Shopify.'});
+async function loadMetaDefs(refresh){const box=document.querySelector('#meta-picker');box.innerHTML='<p class="muted" id="meta-status">Cargando metacampos de ES…</p>';try{const defs=await fetchJSON('/api/shopify/metafield-definitions'+(refresh?'?refresh=true':''));box.innerHTML=(defs.length?'<p class="muted">Metacampos de texto definidos en ES:</p>'+defs.map(d=>`<label><input type="checkbox" class="meta-choice" value="${esc(d.value)}" style="width:auto"> ${esc(d.name)} <code>${esc(d.value)}</code> <span class="muted">· ${d.owners.map(o=>o==='product'?'producto':'variante').join(' + ')}</span></label><br>`).join(''):'<p class="muted">ES no tiene definiciones de metacampos de texto.</p>')+'<button type="button" class="secondary" id="reload-meta">Recargar lista</button>';box.querySelector('#reload-meta').addEventListener('click',()=>loadMetaDefs(true))}catch(e){box.innerHTML='<p class="muted">No se pudo cargar la lista ('+esc(e.message)+'). Puedes añadirlos a mano abajo.</p>'}}
+loadMetaDefs(false);
+function selectedFields(){const fields=[...document.querySelectorAll('.field-choice:checked')].map(x=>x.value);if(!fields.includes('metafields'))for(const c of document.querySelectorAll('.meta-choice:checked'))fields.push('metafield:'+c.value);if(!fields.includes('metafields'))for(const line of document.querySelector('#meta-fields').value.split(String.fromCharCode(10))){const v=line.trim();if(v)fields.push('metafield:'+v)}return fields}
+function addResult(sku,html,ok){const card=document.createElement('section');card.className='card';card.innerHTML=`<h2>SKU ${esc(sku)}</h2>${html}`;results.append(card)}
+document.querySelector('#batch-form').addEventListener('submit',async e=>{e.preventDefault();const skus=[...new Set(document.querySelector('#skus').value.replaceAll(',',String.fromCharCode(10)).split(String.fromCharCode(10)).map(x=>x.trim()).filter(Boolean))];if(!skus.length)return;if(skus.length>50){status.textContent='El máximo es 50 SKU por ejecución.';return}const fields=selectedFields();if(!fields.length){status.textContent='Selecciona al menos un campo a traducir.';return}const run=document.querySelector('#prepare-batch');run.disabled=true;results.replaceChildren();const base={fields};if(storeSelect.value)base.store=storeSelect.value;if(localeSelect.value)base.locale=localeSelect.value;let created=0;for(let i=0;i<skus.length;i++){status.textContent='Preparando '+(i+1)+'/'+skus.length+' · '+skus[i]+'…';try{const batch=await fetchJSON('/api/translation-batches',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...base,sku:skus[i]})});const pending=batch.items.filter(x=>x.state==='PENDING_REVIEW').length,approved=batch.items.filter(x=>x.state==='APPROVED').length,errors=batch.items.filter(x=>x.state==='ERROR').length;created++;addResult(skus[i],`<p>${esc(batch.source_title||'')}</p><p class="muted">${batch.items.length} campo(s): ${pending} pendientes de revisión, ${approved} aprobados automáticamente, ${errors} con error.</p><a class="button secondary" href="/translation-batches#${batch.id}">Abrir lote #${batch.id}</a>`)}catch(err){addResult(skus[i],`<p class="batch-error" role="alert">${esc(err.message)}</p>`)}}run.disabled=false;status.textContent=created+' de '+skus.length+' lote(s) preparados. Revísalos en Revisión de lotes.'});
 </script>'''
     return shell('Traducción en lote',body,'batch')
 
@@ -469,9 +498,34 @@ detail.querySelectorAll('.reopen-approved').forEach(btn=>btn.addEventListener('c
 detail.querySelector('#approve-selected')?.addEventListener('click',async()=>{const ids=[...detail.querySelectorAll('.approve-check:checked')].map(x=>Number(x.value));if(!ids.length){actionStatus.textContent='Selecciona al menos una propuesta revisada.';return}const button=detail.querySelector('#approve-selected');button.disabled=true;actionStatus.textContent='Guardando aprobaciones…';try{await request(`/api/translation-batches/${b.id}/approve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({item_ids:ids})});await loadDetail(b.id);await loadBatches();detail.querySelector('#batch-action-status').textContent=`${ids.length} campo(s) aprobado(s).`}catch(e){actionStatus.textContent='No se pudieron guardar las aprobaciones: '+e.message;button.disabled=false}});
 detail.querySelector('#apply-approved')?.addEventListener('click',async()=>{const ids=[...detail.querySelectorAll('.approve-check:checked')].map(x=>Number(x.value)),selected=ids.length>0;if(!selected&&!approved.length)return;const prompt=selected?`¿Aprobar y aplicar los ${ids.length} campos seleccionados a Shopify?`:`¿Aplicar ${approved.length} campo(s) aprobado(s) a Shopify?`;if(!confirm(prompt+' Esta acción escribe en la tienda.'))return;const button=detail.querySelector('#apply-approved');button.disabled=true;actionStatus.textContent=selected?'Aprobando y aplicando solo los campos seleccionados…':'Aplicando los campos aprobados en Shopify…';try{if(selected)await request(`/api/translation-batches/${b.id}/approve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({item_ids:ids})});await request(`/api/translation-batches/${b.id}/apply`,selected?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({item_ids:ids})}:{method:'POST'});await loadDetail(b.id);await loadBatches();detail.querySelector('#batch-action-status').textContent=selected?`${ids.length} campo(s) aprobado(s) y aplicado(s).`:'Aplicación finalizada. Los campos pendientes siguen disponibles para otra selección.'}catch(e){actionStatus.textContent='No se pudieron aplicar los campos: '+e.message;button.disabled=false}})}
 async function loadDetail(id){detail.innerHTML='<section class="card" role="status">Cargando lote…</section>';try{renderBatch(await request('/api/translation-batches/'+id));detail.querySelector('#batch-detail-title')?.focus({preventScroll:true})}catch(e){detail.innerHTML=`<section class="card"><p class="status" role="alert">${esc(e.message)}</p></section>`}}
-document.querySelector('#refresh-batches').addEventListener('click',loadBatches);loadBatches();
+document.querySelector('#refresh-batches').addEventListener('click',loadBatches);loadBatches();{const m=location.hash.match(/^#([0-9]+)$/);if(m)loadDetail(Number(m[1]))}
 </script>'''
     return shell('Revisión de lotes',body,'review')
+
+TEXT_METAFIELD_TYPES={'single_line_text_field','multi_line_text_field','html','rich_text_field','list.single_line_text_field','list.multi_line_text_field'}
+_metafield_defs_cache={'at':0.0,'data':None}
+
+@app.get('/api/shopify/metafield-definitions')
+def list_metafield_definitions(refresh:bool=False):
+    """Text metafield definitions of the ES store (product and variant), for campaign field pickers."""
+    if not refresh and _metafield_defs_cache['data'] is not None and time.time()-_metafield_defs_cache['at']<600: return _metafield_defs_cache['data']
+    store=next((s for s in shopify_stores() if s['code']=='ES' and s['token']),None)
+    if not store: raise HTTPException(503,'La tienda ES no tiene dominio y token configurados')
+    query='query Defs($owner:MetafieldOwnerType!,$after:String) { metafieldDefinitions(ownerType:$owner,first:100,after:$after) { nodes { namespace key name type { name } } pageInfo { hasNextPage endCursor } } }'
+    found={}
+    for owner,label in (('PRODUCT','product'),('PRODUCTVARIANT','variant')):
+        after=None
+        for _ in range(10):
+            page=shopify_graphql(store['domain'],store['token'],query,{'owner':owner,'after':after}).get('metafieldDefinitions') or {}
+            for d in page.get('nodes',[]):
+                if d['type']['name'] not in TEXT_METAFIELD_TYPES or 'yotpo' in (d['namespace']+d['key']).casefold(): continue
+                item=found.setdefault(f"{d['namespace']}.{d['key']}",{'value':f"{d['namespace']}.{d['key']}",'name':d['name'],'type':d['type']['name'],'owners':[]})
+                item['owners'].append(label)
+            if not page.get('pageInfo',{}).get('hasNextPage'): break
+            after=page['pageInfo']['endCursor']
+    data=sorted(found.values(),key=lambda x:x['value'])
+    _metafield_defs_cache.update(at=time.time(),data=data)
+    return data
 
 @app.get('/api/shopify/products/search')
 def search_shopify_products(q:str):
@@ -951,10 +1005,13 @@ def create_translation_batch(x:TranslationBatchRequest,user=Depends(operator)):
         published=[item['locale'] for item in locales if item.get('published') and not (store['code']=='ES' and item.get('primary')) and (profiles.get(item['locale'].lower()) or {}).get('deepl_target')]
         targets.extend((store['code'],locale) for locale in published)
         if published: target_locales[store['code']]=published
-    if not targets: raise HTTPException(409,'No hay locales publicados de destino en las tiendas activas')
+    if x.store: targets=[t for t in targets if t[0]==x.store]
+    if x.locale: targets=[t for t in targets if t[1].lower()==x.locale.lower()]
+    if not targets: raise HTTPException(409,'No hay locales publicados de destino en las tiendas activas para la selección indicada')
+    target_locales={store:[l for l in locales if (store,l) in set(targets)] for store,locales in target_locales.items()}
+    target_locales={store:locales for store,locales in target_locales.items() if locales}
     with pool.connection() as c:
         batch_id=c.execute("INSERT INTO translation_batches(source_sku,source_product_gid,source_title,state) VALUES(%s,%s,%s,'PREPARING') RETURNING id",(sku,source_product['id'],source_product['title'])).fetchone()[0]
-    main_keys={'descriptionHtml','seo.title','seo.description'}
     try:
         comparison=_compare_shopify_product(source_product['id'],target_locales=target_locales)
     except HTTPException as exc:
@@ -969,7 +1026,7 @@ def create_translation_batch(x:TranslationBatchRequest,user=Depends(operator)):
         column_index=next((i for i,column in enumerate(comparison['columns']) if i>0 and column['label'].startswith(f'{store_code} · {locale}')),None)
         target_items=0
         for field in comparison['fields']:
-            if field['key'] not in main_keys and not field['key'].startswith('metafield.'): continue
+            if not batch_field_selected(field['key'],x.fields): continue
             edit_index=column_index
             if edit_index is None or edit_index>=len(field.get('edits',[])) or not field['edits'][edit_index]:
                 edit_index=next((i for i,item in enumerate(field.get('edits',[])) if item and item.get('store')==store_code and item.get('locale')==locale),None)
@@ -990,7 +1047,7 @@ def create_translation_batch(x:TranslationBatchRequest,user=Depends(operator)):
                   (batch_id,store_code,locale,field['key'],field['label'],source_text,proposed,Jsonb(edit),state,error,Jsonb(quality) if quality else None))
             target_items+=1
         for missing in comparison.get('variant_mapping_errors',[]):
-            if missing['store']!=store_code or missing['locale']!=locale: continue
+            if missing['store']!=store_code or missing['locale']!=locale or not batch_field_selected(missing['field_key'],x.fields): continue
             with pool.connection() as c:
                 c.execute('''INSERT INTO translation_batch_items(batch_id,store_code,locale,field_key,field_label,state,error)
                   VALUES(%s,%s,%s,%s,%s,'ERROR',%s) ON CONFLICT(batch_id,store_code,locale,field_key) DO NOTHING''',
