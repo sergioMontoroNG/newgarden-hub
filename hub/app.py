@@ -72,6 +72,10 @@ class TranslationBatchRequest(BaseModel):
     fields:list[str]|None=Field(default=None,min_length=1,max_length=100)
     store:str|None=Field(default=None,pattern=r'^[A-Z0-9_-]{2,12}$')
     locale:str|None=Field(default=None,min_length=2,max_length=20)
+    # Other SKUs of the same product and whether variant metafields are limited
+    # to the variants of `sku` and `also_skus` instead of every variant.
+    also_skus:list[str]=Field(default_factory=list,max_length=50)
+    variants_of_skus_only:bool=False
 
     @field_validator('fields')
     @classmethod
@@ -95,6 +99,8 @@ def batch_field_selected(key:str,specs:list[str]|None)->bool:
         ns_key=spec[len('metafield:'):]
         if key==f'metafield.product.{ns_key}' or (key.startswith('metafield.variant.') and key.endswith('.'+ns_key)): return True
     return False
+class TranslationBatchResolve(BaseModel):
+    skus:list[str]=Field(min_length=1,max_length=50)
 class TranslationBatchItemIds(BaseModel):
     item_ids:list[int]=Field(min_length=1,max_length=500)
 class TranslationBatchItemEdit(BaseModel):
@@ -465,7 +471,7 @@ form.addEventListener('submit',async event=>{{event.preventDefault();if(!editTar
 
 @app.get('/products/batch',response_class=HTMLResponse)
 def batch_products_page():
-    body='''<main class="wrap"><h1>Campaña de traducción por SKU</h1><p class="lede">Elige varios SKU y, si quieres, solo los campos que te interesan para esta campaña. El servicio prepara las propuestas de un producto cada vez y las deja en <a href="/translation-batches">Revisión de lotes</a>. Nada se escribe en Shopify hasta que alguien revise, apruebe y aplique.</p><section class="card"><form id="batch-form"><div class="field"><label for="skus">SKU (uno por línea o separados por coma)</label><textarea id="skus" required maxlength="20000" placeholder="NG-1234&#10;NG-5678"></textarea></div><div class="grid"><div class="field"><label for="target-store">Tienda destino</label><select id="target-store" disabled><option>Cargando tiendas…</option></select></div><div class="field"><label for="target-locale">Locale destino</label><select id="target-locale" disabled><option value="">Todos los locales</option></select></div></div><fieldset class="field"><legend>Campos a traducir</legend><label><input type="checkbox" class="field-choice" value="descriptionHtml" checked style="width:auto"> Descripción</label><br><label><input type="checkbox" class="field-choice" value="seo.title" checked style="width:auto"> SEO · título</label><br><label><input type="checkbox" class="field-choice" value="seo.description" checked style="width:auto"> SEO · descripción</label><br><label><input type="checkbox" class="field-choice" value="metafields" style="width:auto"> Todos los metacampos (producto y variantes)</label><div id="meta-picker" class="field"><p class="muted" id="meta-status">Cargando metacampos de ES…</p></div><details class="field"><summary>Añadir metacampos a mano</summary><label for="meta-fields">Metacampos adicionales (<code>namespace.key</code>, uno por línea)</label><textarea id="meta-fields" rows="3" maxlength="4000" placeholder="custom.ficha_tecnica"></textarea></details></fieldset><p id="batch-status" class="muted" role="status" aria-live="polite"></p><div class="actions"><button id="prepare-batch" type="submit">Preparar lotes para revisión</button><a class="button secondary" href="/products">Volver al explorador</a></div><p class="muted">La preparación consulta Shopify y DeepL y guarda los lotes en el hub; no escribe en Shopify. Máximo 50 SKU por ejecución.</p></form></section><section id="batch-results" aria-live="polite"></section></main><script>
+    body='''<main class="wrap"><h1>Campaña de traducción por SKU</h1><p class="lede">Elige varios SKU y, si quieres, solo los campos que te interesan para esta campaña. El servicio prepara las propuestas de un producto cada vez y las deja en <a href="/translation-batches">Revisión de lotes</a>. Nada se escribe en Shopify hasta que alguien revise, apruebe y aplique.</p><section class="card"><form id="batch-form"><div class="field"><label for="skus">SKU (uno por línea o separados por coma)</label><textarea id="skus" required maxlength="20000" placeholder="NG-1234&#10;NG-5678"></textarea></div><div class="grid"><div class="field"><label for="target-store">Tienda destino</label><select id="target-store" disabled><option>Cargando tiendas…</option></select></div><div class="field"><label for="target-locale">Locale destino</label><select id="target-locale" disabled><option value="">Todos los locales</option></select></div></div><fieldset class="field"><legend>Campos a traducir</legend><label><input type="checkbox" class="field-choice" value="descriptionHtml" checked style="width:auto"> Descripción</label><br><label><input type="checkbox" class="field-choice" value="seo.title" checked style="width:auto"> SEO · título</label><br><label><input type="checkbox" class="field-choice" value="seo.description" checked style="width:auto"> SEO · descripción</label><br><label><input type="checkbox" class="field-choice" value="metafields" style="width:auto"> Todos los metacampos (producto y variantes)</label><div id="meta-picker" class="field"><p class="muted" id="meta-status">Cargando metacampos de ES…</p></div><details class="field"><summary>Añadir metacampos a mano</summary><label for="meta-fields">Metacampos adicionales (<code>namespace.key</code>, uno por línea)</label><textarea id="meta-fields" rows="3" maxlength="4000" placeholder="custom.ficha_tecnica"></textarea></details><label><input type="checkbox" id="variant-only" checked style="width:auto"> Metacampos de variante: solo las variantes de los SKU indicados (si no, se traducen las de todas las variantes del producto)</label></fieldset><p id="batch-status" class="muted" role="status" aria-live="polite"></p><div class="actions"><button id="prepare-batch" type="submit">Preparar lotes para revisión</button><a class="button secondary" href="/products">Volver al explorador</a></div><p class="muted">La preparación consulta Shopify y DeepL y guarda los lotes en el hub; no escribe en Shopify. Máximo 50 SKU por ejecución.</p></form></section><section id="batch-results" aria-live="polite"></section></main><script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const storeSelect=document.querySelector('#target-store'),localeSelect=document.querySelector('#target-locale'),status=document.querySelector('#batch-status'),results=document.querySelector('#batch-results');
 async function fetchJSON(url,options){const r=await fetch(url,options);let data={};try{data=await r.json()}catch{}if(!r.ok)throw new Error(typeof data.detail==='string'?data.detail:'Error al procesar la solicitud');return data}
@@ -476,7 +482,7 @@ async function loadMetaDefs(refresh){const box=document.querySelector('#meta-pic
 loadMetaDefs(false);
 function selectedFields(){const fields=[...document.querySelectorAll('.field-choice:checked')].map(x=>x.value);if(!fields.includes('metafields'))for(const c of document.querySelectorAll('.meta-choice:checked'))fields.push('metafield:'+c.value);if(!fields.includes('metafields'))for(const line of document.querySelector('#meta-fields').value.split(String.fromCharCode(10))){const v=line.trim();if(v)fields.push('metafield:'+v)}return fields}
 function addResult(sku,html,ok){const card=document.createElement('section');card.className='card';card.innerHTML=`<h2>SKU ${esc(sku)}</h2>${html}`;results.append(card)}
-document.querySelector('#batch-form').addEventListener('submit',async e=>{e.preventDefault();const skus=[...new Set(document.querySelector('#skus').value.replaceAll(',',String.fromCharCode(10)).split(String.fromCharCode(10)).map(x=>x.trim()).filter(Boolean))];if(!skus.length)return;if(skus.length>50){status.textContent='El máximo es 50 SKU por ejecución.';return}const fields=selectedFields();if(!fields.length){status.textContent='Selecciona al menos un campo a traducir.';return}const run=document.querySelector('#prepare-batch');run.disabled=true;results.replaceChildren();const base={fields};if(storeSelect.value)base.store=storeSelect.value;if(localeSelect.value)base.locale=localeSelect.value;let created=0;for(let i=0;i<skus.length;i++){status.textContent='Preparando '+(i+1)+'/'+skus.length+' · '+skus[i]+'…';try{const batch=await fetchJSON('/api/translation-batches',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...base,sku:skus[i]})});const pending=batch.items.filter(x=>x.state==='PENDING_REVIEW').length,approved=batch.items.filter(x=>x.state==='APPROVED').length,errors=batch.items.filter(x=>x.state==='ERROR').length;created++;addResult(skus[i],`<p>${esc(batch.source_title||'')}</p><p class="muted">${batch.items.length} campo(s): ${pending} pendientes de revisión, ${approved} aprobados automáticamente, ${errors} con error.</p><a class="button secondary" href="/translation-batches#${batch.id}">Abrir lote #${batch.id}</a>`)}catch(err){addResult(skus[i],`<p class="batch-error" role="alert">${esc(err.message)}</p>`)}}run.disabled=false;status.textContent=created+' de '+skus.length+' lote(s) preparados. Revísalos en Revisión de lotes.'});
+document.querySelector('#batch-form').addEventListener('submit',async e=>{e.preventDefault();const skus=[...new Set(document.querySelector('#skus').value.replaceAll(',',String.fromCharCode(10)).split(String.fromCharCode(10)).map(x=>x.trim()).filter(Boolean))];if(!skus.length)return;if(skus.length>50){status.textContent='El máximo es 50 SKU por ejecución.';return}const fields=selectedFields();if(!fields.length){status.textContent='Selecciona al menos un campo a traducir.';return}const run=document.querySelector('#prepare-batch');run.disabled=true;results.replaceChildren();const base={fields};if(storeSelect.value)base.store=storeSelect.value;if(localeSelect.value)base.locale=localeSelect.value;base.variants_of_skus_only=document.querySelector('#variant-only').checked;let created=0,groups=[];status.textContent='Resolviendo '+skus.length+' SKU en ES…';try{const resolved=await fetchJSON('/api/translation-batches/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({skus})});groups=resolved.groups;resolved.errors.forEach(x=>addResult(x.sku,`<p class="batch-error" role="alert">${esc(x.error)}</p>`))}catch(err){status.textContent=err.message;run.disabled=false;return}for(let i=0;i<groups.length;i++){const g=groups[i];status.textContent='Preparando '+(i+1)+'/'+groups.length+' · '+g.skus.join(', ')+'…';try{const batch=await fetchJSON('/api/translation-batches',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...base,sku:g.skus[0],also_skus:g.skus.slice(1)})});const pending=batch.items.filter(x=>x.state==='PENDING_REVIEW').length,approved=batch.items.filter(x=>x.state==='APPROVED').length,errors=batch.items.filter(x=>x.state==='ERROR').length;created++;addResult(g.skus.join(', '),`<p>${esc(batch.source_title||g.title)}</p>${g.skus.length>1?`<p class="muted">Estos ${g.skus.length} SKU son del mismo producto: se ha creado un solo lote.</p>`:''}<p class="muted">${batch.items.length} campo(s): ${pending} pendientes de revisión, ${approved} aprobados automáticamente, ${errors} con error.</p>${batch.items.filter(x=>x.state==='ERROR').slice(0,3).map(x=>`<p class="batch-error">${esc(x.store)} · ${esc(x.locale)}: ${esc(x.error||'')}</p>`).join('')}<a class="button secondary" href="/translation-batches#${batch.id}">Abrir lote #${batch.id}</a>`)}catch(err){addResult(g.skus.join(', '),`<p class="batch-error" role="alert">${esc(err.message)}</p>`)}}run.disabled=false;status.textContent=created+' lote(s) preparados de '+groups.length+' producto(s). Revísalos en Revisión de lotes.'});
 </script>'''
     return shell('Traducción en lote',body,'batch')
 
@@ -978,6 +984,32 @@ def translation_batch_payload(batch_id:int):
     return {'id':batch[0],'sku':batch[1],'source_product_gid':batch[2],'source_title':batch[3],'state':batch[4],'error':batch[5],'created_at':batch[6],'updated_at':batch[7],
       'items':[dict(zip(('id','store','locale','field_key','field_label','source_text','proposed_text','edit_payload','state','error','created_at','updated_at','quality'),row)) for row in rows]}
 
+def batch_variant_allowed(key:str,skus:list[str]|None)->bool:
+    if skus is None or not key.startswith('metafield.variant.'): return True
+    rest=key[len('metafield.variant.'):].casefold()
+    return any(rest.startswith(s.strip().casefold()+'.') for s in skus)
+
+def resolve_es_product_by_sku(source_store,sku:str):
+    hits=shopify_search(source_store,sku,20)
+    unique={p['id']:p for p in hits if any((v.get('sku') or '').strip().casefold()==sku.casefold() for v in p.get('variants',{}).get('nodes',[]))}
+    if not unique: raise HTTPException(404,'No se encontró un producto ES con ese SKU exacto')
+    if len(unique)>1: raise HTTPException(409,'El SKU coincide con varios productos de ES')
+    return next(iter(unique.values()))
+
+@app.post('/api/translation-batches/resolve')
+def resolve_translation_batch_skus(x:TranslationBatchResolve,user=Depends(operator)):
+    """Group SKUs by their ES product so a campaign creates one batch per product."""
+    source_store=next((s for s in shopify_stores() if s['code']=='ES' and s['token']),None)
+    if not source_store: raise HTTPException(503,'La tienda ES no tiene dominio y token configurados')
+    groups={}; errors=[]
+    for sku in dict.fromkeys(v.strip() for v in x.skus if v.strip()):
+        try: product=resolve_es_product_by_sku(source_store,sku)
+        except HTTPException as exc:
+            errors.append({'sku':sku,'error':str(exc.detail)}); continue
+        group=groups.setdefault(product['id'],{'product_gid':product['id'],'title':product['title'],'skus':[]})
+        group['skus'].append(sku)
+    return {'groups':list(groups.values()),'errors':errors}
+
 @app.get('/api/translation-batches')
 def list_translation_batches(user=Depends(operator)):
     with pool.connection() as c:
@@ -989,12 +1021,9 @@ def create_translation_batch(x:TranslationBatchRequest,user=Depends(operator)):
     sku=x.sku.strip()
     stores=shopify_stores(); source_store=next((s for s in stores if s['code']=='ES' and s['token']),None)
     if not source_store: raise HTTPException(503,'La tienda ES no tiene dominio y token configurados')
-    hits=shopify_search(source_store,sku,20)
-    candidates=[p for p in hits if any((v.get('sku') or '').strip().casefold()==sku.casefold() for v in p.get('variants',{}).get('nodes',[]))]
-    unique={p['id']:p for p in candidates}
-    if not unique: raise HTTPException(404,'No se encontró un producto ES con ese SKU exacto')
-    if len(unique)>1: raise HTTPException(409,'El SKU coincide con varios productos de ES')
-    source_product=next(iter(unique.values()))
+    source_product=resolve_es_product_by_sku(source_store,sku)
+    allowed_skus=[sku,*[v.strip() for v in x.also_skus if v.strip()]] if x.variants_of_skus_only else None
+    label_sku=', '.join(dict.fromkeys([sku,*[v.strip() for v in x.also_skus if v.strip()]]))
     source_locale=next((item['locale'] for item in shopify_shop_locales(source_store) if item.get('primary')),'es-ES')
     targets=[]; target_locales={}
     for store in stores:
@@ -1011,7 +1040,7 @@ def create_translation_batch(x:TranslationBatchRequest,user=Depends(operator)):
     target_locales={store:[l for l in locales if (store,l) in set(targets)] for store,locales in target_locales.items()}
     target_locales={store:locales for store,locales in target_locales.items() if locales}
     with pool.connection() as c:
-        batch_id=c.execute("INSERT INTO translation_batches(source_sku,source_product_gid,source_title,state) VALUES(%s,%s,%s,'PREPARING') RETURNING id",(sku,source_product['id'],source_product['title'])).fetchone()[0]
+        batch_id=c.execute("INSERT INTO translation_batches(source_sku,source_product_gid,source_title,state) VALUES(%s,%s,%s,'PREPARING') RETURNING id",(label_sku,source_product['id'],source_product['title'])).fetchone()[0]
     try:
         comparison=_compare_shopify_product(source_product['id'],target_locales=target_locales)
     except HTTPException as exc:
@@ -1022,11 +1051,12 @@ def create_translation_batch(x:TranslationBatchRequest,user=Depends(operator)):
                   (batch_id,store_code,locale,str(exc.detail)[:500]))
             c.execute("UPDATE translation_batches SET state='READY_WITH_ERRORS',error=%s,updated_at=now() WHERE id=%s",(str(exc.detail)[:500],batch_id))
         return translation_batch_payload(batch_id)
+    empty_message='Ninguno de los campos seleccionados existe, tiene contenido en origen o tiene equivalente editable en este destino' if x.fields is not None else 'No se encontró un producto equivalente o campos principales editables en el destino'
     for store_code,locale in targets:
         column_index=next((i for i,column in enumerate(comparison['columns']) if i>0 and column['label'].startswith(f'{store_code} · {locale}')),None)
         target_items=0
         for field in comparison['fields']:
-            if not batch_field_selected(field['key'],x.fields): continue
+            if not batch_field_selected(field['key'],x.fields) or not batch_variant_allowed(field['key'],allowed_skus): continue
             edit_index=column_index
             if edit_index is None or edit_index>=len(field.get('edits',[])) or not field['edits'][edit_index]:
                 edit_index=next((i for i,item in enumerate(field.get('edits',[])) if item and item.get('store')==store_code and item.get('locale')==locale),None)
@@ -1047,7 +1077,7 @@ def create_translation_batch(x:TranslationBatchRequest,user=Depends(operator)):
                   (batch_id,store_code,locale,field['key'],field['label'],source_text,proposed,Jsonb(edit),state,error,Jsonb(quality) if quality else None))
             target_items+=1
         for missing in comparison.get('variant_mapping_errors',[]):
-            if missing['store']!=store_code or missing['locale']!=locale or not batch_field_selected(missing['field_key'],x.fields): continue
+            if missing['store']!=store_code or missing['locale']!=locale or not batch_field_selected(missing['field_key'],x.fields) or not batch_variant_allowed(missing['field_key'],allowed_skus): continue
             with pool.connection() as c:
                 c.execute('''INSERT INTO translation_batch_items(batch_id,store_code,locale,field_key,field_label,state,error)
                   VALUES(%s,%s,%s,%s,%s,'ERROR',%s) ON CONFLICT(batch_id,store_code,locale,field_key) DO NOTHING''',
@@ -1056,8 +1086,8 @@ def create_translation_batch(x:TranslationBatchRequest,user=Depends(operator)):
         if target_items==0:
             with pool.connection() as c:
                 c.execute('''INSERT INTO translation_batch_items(batch_id,store_code,locale,field_key,field_label,state,error)
-                  VALUES(%s,%s,%s,'__product__','Producto','ERROR','No se encontró un producto equivalente o campos principales editables en el destino')
-                  ON CONFLICT(batch_id,store_code,locale,field_key) DO NOTHING''',(batch_id,store_code,locale))
+                  VALUES(%s,%s,%s,'__product__','Producto','ERROR',%s)
+                  ON CONFLICT(batch_id,store_code,locale,field_key) DO NOTHING''',(batch_id,store_code,locale,empty_message))
     with pool.connection() as c:
         c.execute("UPDATE translation_batches SET state=CASE WHEN EXISTS(SELECT 1 FROM translation_batch_items WHERE batch_id=%s AND state='PENDING_REVIEW') THEN 'PENDING_REVIEW' WHEN EXISTS(SELECT 1 FROM translation_batch_items WHERE batch_id=%s AND state='APPROVED') THEN 'APPROVED' ELSE 'READY_WITH_ERRORS' END,updated_at=now() WHERE id=%s",(batch_id,batch_id,batch_id))
     return translation_batch_payload(batch_id)
