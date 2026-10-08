@@ -31,6 +31,40 @@ def _html_tags(value):
     return Counter(parser.tags)
 
 
+# Double quotation marks in the usual typographic styles (straight, German,
+# English, French) plus their HTML entity forms.
+_QUOTE_CHARS = '"„“”‟«»'
+_QUOTE_ENTITIES = re.compile(r"&(?:quot|ldquo|rdquo|bdquo|laquo|raquo|#34|#8220|#8221|#8222|#171|#187);", re.I)
+
+
+def has_double_quotes(value, is_html=False):
+    # Attribute quotes inside tags are markup, not text.
+    value = re.sub(r"<[^>]*>", " ", value or "") if is_html else (value or "")
+    return any(ch in _QUOTE_CHARS for ch in value) or bool(_QUOTE_ENTITIES.search(value))
+
+
+def strip_added_quotes(source, translation, is_html=False):
+    """Remove double quotes the translator added around words.
+
+    DeepL often wraps model names in quotes (e.g. German „Lola Nature“). When the
+    source has no double quotes at all, any in the translation were added by the
+    engine, so they are dropped from text (never from HTML tags or attributes).
+    """
+    if not translation or has_double_quotes(source, is_html) or not has_double_quotes(translation, is_html):
+        return translation
+
+    def clean(text):
+        text = _QUOTE_ENTITIES.sub("", text)
+        text = re.sub(r"«[\s\u00a0\u202f]*", "", text)
+        text = re.sub(r"[\s\u00a0\u202f]*»", "", text)
+        return "".join(ch for ch in text if ch not in _QUOTE_CHARS)
+
+    if not is_html:
+        return clean(translation)
+    return "".join(part if (part.startswith("<") and part.endswith(">")) else clean(part)
+                   for part in re.split(r"(<[^>]+>)", translation))
+
+
 def _numbers(value):
     # Normalize spaces and unit case while retaining decimal punctuation.
     pattern = re.compile(r"(?<!\w)(\d+(?:[.,]\d+)*)(?:\s?(mm|cm|kg|lm|°c|m|g|w|v|%))?", re.I)
@@ -90,6 +124,13 @@ def assess_translation(source, proposal, *, is_html=False):
     if unchanged and re.search(r"[A-Za-zÀ-ÿ]{3}", source):
         score -= 20
     checks.append({"name": "not_unchanged", "passed": not unchanged, "warning_only": True})
+
+    # Quotes that appear or vanish between source and proposal are a common
+    # machine-translation artefact; they need a human look but do not block.
+    quotes_match = has_double_quotes(source, is_html) == has_double_quotes(proposal, is_html)
+    if not quotes_match:
+        score -= 20
+    checks.append({"name": "quotes_consistent", "passed": quotes_match})
 
     if hard_failures:
         score = 0
