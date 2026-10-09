@@ -1164,7 +1164,7 @@ def create_translation_batch(x:TranslationBatchRequest,user=Depends(operator)):
                 translated=translate_cell(request,user)
                 proposed=translated['translation']; error=None
                 quality=assess_translation(source_text,proposed,is_html=request.html)
-                state='APPROVED' if quality['status']=='PASS' and not translated.get('require_review') and (x.auto_apply or (field['key']!='handle' and os.getenv('QUALITY_AUTO_APPROVE','true').lower() in ('1','true','yes','on'))) else 'PENDING_REVIEW'
+                state='APPROVED' if quality['status']=='PASS' and (x.auto_apply or (not translated.get('require_review') and field['key']!='handle' and os.getenv('QUALITY_AUTO_APPROVE','true').lower() in ('1','true','yes','on'))) else 'PENDING_REVIEW'
             except Exception as exc:
                 proposed=None; quality=None; state='ERROR'; error=str(exc.detail if isinstance(exc,HTTPException) else exc)[:500]
             with pool.connection() as c:
