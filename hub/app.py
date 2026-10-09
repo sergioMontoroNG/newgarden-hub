@@ -11,7 +11,6 @@ from .db import pool, initialize
 from .skufile import extract_skus
 from .quality import assess_translation, strip_added_quotes
 from .profiles import active_profiles, target_profile
-from . import glossary_ai
 
 def operator():
     # This service is intended to be reachable only on the trusted local network.
@@ -54,11 +53,6 @@ class GlossaryTerm(BaseModel):
     source_term:str=Field(min_length=1,max_length=500)
     target_term:str=Field(min_length=1,max_length=500)
     enabled:bool=True
-class AIValidateRequest(BaseModel):
-    store:str|None=None
-    locale:str|None=None
-    revalidate:bool=False
-    exclude_ids:list[int]=Field(default_factory=list,max_length=5000)
 class AIApplyRequest(BaseModel):
     store:str|None=None
     locale:str|None=None
@@ -322,24 +316,23 @@ document.querySelector('#term-form').addEventListener('submit',async e=>{e.preve
 
 @app.get('/glossary/review',response_class=HTMLResponse)
 def glossary_review_page():
-    body="""<main class="wrap"><h1>Revisión de candidatos de glosario</h1><p class="lede">Términos propuestos a partir del catálogo ya traducido. Elige el valor canónico de cada tienda (puedes escribir otro o tomar una alternativa) y apruébalo para que se aplique en las traducciones. Nada se aplica hasta aprobarlo.</p><section class="card"><form id="filters"><div class="grid"><div class="field"><label for="f-store">Tienda · idioma destino</label><select id="f-store"></select></div><div class="field"><label for="f-q">Buscar término</label><input id="f-q" type="search" placeholder="Término ES, traducción o alternativa" autocomplete="off"></div><div class="field"><label for="f-status">Estado</label><select id="f-status"><option value="pending">Pendientes</option><option value="approved">Aprobados</option><option value="rejected">Rechazados</option><option value="">Todos</option></select></div><div class="field"><label for="f-kind">Tipo</label><select id="f-kind"><option value="">Todos</option><option value="term">Traducciones</option><option value="invariant">No traducir (nombres, modelos)</option></select></div><div class="field"><label for="f-conflicts">Inconsistencias</label><select id="f-conflicts"><option value="">Todas</option><option value="1">Solo con alternativas</option></select></div><div class="field"><label for="f-ai">Sugerencia de IA</label><select id="f-ai"><option value="">Todas</option><option value="none">Sin validar</option><option value="approve">Aprobar</option><option value="reject">Rechazar</option><option value="review">Revisar a mano</option></select></div></div></form><p id="summary" class="muted" role="status"></p><div class="toolbar"><button type="button" id="ai-run">Validar pendientes con IA</button> <button type="button" class="secondary" id="ai-apply">Aplicar sugerencias de IA</button> <span id="ai-status" class="status" role="status"></span></div></section><section class="card"><div id="candidates" tabindex="0" role="region" aria-label="Candidatos de glosario">Cargando…</div></section></main><script>
+    body="""<main class="wrap"><h1>Revisión de candidatos de glosario</h1><p class="lede">Términos propuestos a partir del catálogo ya traducido. Elige el valor canónico de cada tienda (puedes escribir otro o tomar una alternativa) y apruébalo para que se aplique en las traducciones. Nada se aplica hasta aprobarlo.</p><section class="card"><form id="filters"><div class="grid"><div class="field"><label for="f-store">Tienda · idioma destino</label><select id="f-store"></select></div><div class="field"><label for="f-q">Buscar término</label><input id="f-q" type="search" placeholder="Término ES, traducción o alternativa" autocomplete="off"></div><div class="field"><label for="f-status">Estado</label><select id="f-status"><option value="pending">Pendientes</option><option value="approved">Aprobados</option><option value="rejected">Rechazados</option><option value="">Todos</option></select></div><div class="field"><label for="f-kind">Tipo</label><select id="f-kind"><option value="">Todos</option><option value="term">Traducciones</option><option value="invariant">No traducir (nombres, modelos)</option></select></div><div class="field"><label for="f-conflicts">Inconsistencias</label><select id="f-conflicts"><option value="">Todas</option><option value="1">Solo con alternativas</option></select></div><div class="field"><label for="f-ai">Sugerencia</label><select id="f-ai"><option value="">Todas</option><option value="none">Sin sugerencia</option><option value="approve">Aprobar</option><option value="reject">Rechazar</option><option value="review">Revisar a mano</option></select></div></div></form><p id="summary" class="muted" role="status"></p><div class="toolbar"><button type="button" id="ai-apply">Aplicar sugerencias</button> <span id="ai-status" class="status" role="status"></span></div></section><section class="card"><div id="candidates" tabindex="0" role="region" aria-label="Candidatos de glosario">Cargando…</div></section></main><script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
-const box=document.querySelector('#candidates'),summary=document.querySelector('#summary'),ids=['#f-store','#f-status','#f-kind','#f-conflicts','#f-ai'];let aiEnabled=false;
+const box=document.querySelector('#candidates'),summary=document.querySelector('#summary'),ids=['#f-store','#f-status','#f-kind','#f-conflicts','#f-ai'];
 const badge={pending:'Pendiente',approved:'Aprobado',rejected:'Rechazado'};
-const aiLabel={approve:'IA: aprobar',reject:'IA: rechazar',review:'IA: revisar'};
-const aiCell=c=>c.ai_verdict?`<span class="badge">${aiLabel[c.ai_verdict]}</span>${c.ai_verdict==='approve'&&c.ai_term&&c.ai_term!==c.target_term?`<br><button type="button" class="secondary pick" data-term="${esc(c.ai_term)}">${esc(c.ai_term)}</button>`:''}${c.ai_reason?`<br><small class="muted">${esc(c.ai_reason)}</small>`:''}`:'<small class="muted">Sin validar</small>';
+const aiLabel={approve:'Sugerido: aprobar',reject:'Sugerido: rechazar',review:'Sugerido: revisar'};
+const aiCell=c=>c.ai_verdict?`<span class="badge">${aiLabel[c.ai_verdict]}</span>${c.ai_verdict==='approve'&&c.ai_term&&c.ai_term!==c.target_term?`<br><button type="button" class="secondary pick" data-term="${esc(c.ai_term)}">${esc(c.ai_term)}</button>`:''}${c.ai_reason?`<br><small class="muted">${esc(c.ai_reason)}</small>`:''}`:'<small class="muted">Sin sugerencia</small>';
 const post=async(url,body)=>{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||'La petición falló');return d};
 const scope=()=>{const [store,locale]=document.querySelector('#f-store').value.split('|');return {store:store||null,locale:locale||null}};
 let busy=false;
-document.querySelector('#ai-run').addEventListener('click',async e=>{if(busy)return;const st=document.querySelector('#ai-status');if(!aiEnabled){st.textContent='Falta ANTHROPIC_API_KEY en .env';return}busy=true;e.target.disabled=true;let done=0;const seen=[];try{while(true){const d=await post('/api/glossary-candidates/ai-validate',{...scope(),exclude_ids:seen});if(!d.ids.length)break;seen.push(...d.ids);done+=d.processed;st.textContent='Validados '+done+' · quedan '+d.remaining+'…';if(!d.remaining)break}st.textContent='Validación terminada: '+done+' candidatos. Revisa y aplica las sugerencias.'}catch(err){st.textContent=err.message+(done?' · ya validados: '+done:'')}busy=false;e.target.disabled=false;load()});
-document.querySelector('#ai-apply').addEventListener('click',async()=>{if(busy)return;const st=document.querySelector('#ai-status');const sc=scope();const label=sc.store?sc.store+' · '+sc.locale:'todas las tiendas';const verdicts=[];if(confirm('¿Aprobar en el glosario los pendientes que la IA sugiere aprobar ('+label+')? Se usará el valor propuesto por la IA.'))verdicts.push('approve');if(confirm('¿Rechazar también los pendientes que la IA sugiere rechazar ('+label+')?'))verdicts.push('reject');if(!verdicts.length)return;busy=true;try{const d=await post('/api/glossary-candidates/apply-ai',{...sc,verdicts});st.textContent='Aprobados: '+d.approved+' · rechazados: '+d.rejected}catch(err){st.textContent=err.message}busy=false;load()});
+document.querySelector('#ai-apply').addEventListener('click',async()=>{if(busy)return;const st=document.querySelector('#ai-status');const sc=scope();const label=sc.store?sc.store+' · '+sc.locale:'todas las tiendas';const verdicts=[];if(confirm('¿Aprobar en el glosario los pendientes que se sugiere aprobar ('+label+')? Se usará el valor sugerido.'))verdicts.push('approve');if(confirm('¿Rechazar también los pendientes que se sugiere rechazar ('+label+')?'))verdicts.push('reject');if(!verdicts.length)return;busy=true;try{const d=await post('/api/glossary-candidates/apply-ai',{...sc,verdicts});st.textContent='Aprobados: '+d.approved+' · rechazados: '+d.rejected}catch(err){st.textContent=err.message}busy=false;load()});
 let qTimer;document.querySelector('#f-q').addEventListener('input',()=>{clearTimeout(qTimer);qTimer=setTimeout(load,300)});
 async function load(){const q=new URLSearchParams();const v=id=>document.querySelector(id).value;if(v('#f-store')){const [st,lo]=v('#f-store').split('|');q.set('store',st);q.set('locale',lo)}if(v('#f-q').trim())q.set('q',v('#f-q').trim());if(v('#f-ai'))q.set('ai',v('#f-ai'));if(v('#f-status'))q.set('status',v('#f-status'));if(v('#f-kind'))q.set('kind',v('#f-kind'));if(v('#f-conflicts'))q.set('conflicts','1');
  let d;try{const r=await fetch('/api/glossary-candidates?'+q);d=await r.json();if(!r.ok)throw new Error(d.detail||'No se pudieron cargar los candidatos')}catch(e){box.textContent=e.message;return}
- aiEnabled=d.ai_enabled;const sel=document.querySelector('#f-store');if(sel.dataset.ready!=='1'){sel.innerHTML='<option value="">Todas</option>'+d.targets.map(t=>`<option value="${esc(t.store+'|'+t.locale)}">${esc(t.store)} · ${esc(t.locale)}</option>`).join('');sel.dataset.ready='1'}
+ const sel=document.querySelector('#f-store');if(sel.dataset.ready!=='1'){sel.innerHTML='<option value="">Todas</option>'+d.targets.map(t=>`<option value="${esc(t.store+'|'+t.locale)}">${esc(t.store)} · ${esc(t.locale)}</option>`).join('');sel.dataset.ready='1'}
  summary.textContent=d.candidates.length+' candidatos · '+Object.entries(d.counts).map(([k,n])=>(badge[k]||k)+': '+n).join(' · ');
  if(!d.candidates.length){box.innerHTML='<p class="muted">No hay candidatos con estos filtros.'+(v('#f-store')&&!Object.keys(d.counts).length?' Este idioma aún no tiene candidatos: se generan con <code>python -m hub.mine</code> a partir de traducciones históricas.':'')+'</p>';return}
- box.innerHTML='<table><tr><th>Tienda · idioma</th><th>Término ES</th><th>Valor canónico</th><th>Alternativas detectadas</th><th>Evidencia</th><th>IA</th><th>Estado</th><th>Acciones</th></tr>'+d.candidates.map(c=>{
+ box.innerHTML='<table><tr><th>Tienda · idioma</th><th>Término ES</th><th>Valor canónico</th><th>Alternativas detectadas</th><th>Evidencia</th><th>Sugerencia</th><th>Estado</th><th>Acciones</th></tr>'+d.candidates.map(c=>{
   const alts=[{term:c.original_term,support:c.support,dice:c.dice,main:true},...c.alternatives.map(a=>({term:a.term,support:a.support,dice:a.dice}))];
   const locked=c.status!=='pending';
   return `<tr data-id="${c.id}"><td>${esc(c.target_store)} · ${esc(c.target_locale)}</td><td><strong>${esc(c.source_term)}</strong>${c.kind==='invariant'?'<br><span class="badge">No traducir</span>':''}</td><td><input class="canon" value="${esc(c.target_term)}" aria-label="Valor canónico de ${esc(c.source_term)}" ${locked?'disabled':''}>${c.existing&&c.existing!==c.target_term?`<br><small class="muted">En glosario: ${esc(c.existing)}</small>`:''}</td><td>${locked?'':alts.map(a=>`<button type="button" class="secondary pick" data-term="${esc(a.term)}" title="${a.support} productos · afinidad ${a.dice}">${esc(a.term)} <small>(${a.support})</small></button>`).join(' ')}</td><td>${c.support} de ${c.source_products} productos<br><small class="muted">afinidad ${c.dice}</small></td><td>${aiCell(c)}</td><td><span class="badge">${esc(badge[c.status]||c.status)}</span></td><td class="actions">${c.status==='pending'?'<button type="button" class="approve">Aprobar</button> <button type="button" class="secondary reject">Rechazar</button>':'<button type="button" class="secondary reopen">Reabrir</button>'}<span class="status" role="status"></span></td></tr>`}).join('')+'</table>'}
@@ -382,7 +375,7 @@ def list_glossary_candidates(store:str|None=None,locale:str|None=None,status:str
     keys=('id','target_store','target_locale','source_term','target_term','kind','support','source_products','dice','alternatives','status','existing','ai_verdict','ai_term','ai_reason')
     out=[dict(zip(keys,r)) for r in rows]
     for item in out: item['original_term']=item['target_term']
-    return {'candidates':out,'targets':targets,'counts':counts,'ai_enabled':glossary_ai.configured()}
+    return {'candidates':out,'targets':targets,'counts':counts}
 
 def _candidate_or_404(c,candidate_id):
     row=c.execute('SELECT id,target_store,target_locale,source_term,target_term,status FROM glossary_candidates WHERE id=%s FOR UPDATE',(candidate_id,)).fetchone()
@@ -406,33 +399,9 @@ def approve_glossary_candidate(candidate_id:int,x:CandidateDecision,user=Depends
         _approve_candidate(c,candidate_id,store,locale,source_term,term)
     return {'approved':True}
 
-AI_BATCH=25
-
-@app.post('/api/glossary-candidates/ai-validate')
-def ai_validate_glossary_candidates(x:AIValidateRequest,user=Depends(operator)):
-    """Valida con IA un lote de pendientes y guarda la sugerencia; devuelve cuántos faltan para poder iterar desde la UI."""
-    if not glossary_ai.configured(): raise HTTPException(400,'Falta configurar ANTHROPIC_API_KEY en .env')
-    where=["status='pending'"]; params=[]
-    if not x.revalidate: where.append('ai_verdict IS NULL')
-    if x.store: where.append('target_store=%s'); params.append(x.store)
-    if x.locale: where.append('lower(target_locale)=lower(%s)'); params.append(x.locale)
-    if x.exclude_ids: where.append('NOT (id = ANY(%s))'); params.append(x.exclude_ids)
-    clause=' AND '.join(where)
-    with pool.connection() as c:
-        rows=c.execute(f"SELECT id,target_store,target_locale,source_term,target_term,kind,support,alternatives FROM glossary_candidates WHERE {clause} ORDER BY support DESC,id LIMIT {AI_BATCH}",params).fetchall()
-        remaining=c.execute(f"SELECT count(*) FROM glossary_candidates WHERE {clause}",params).fetchone()[0]
-    batch=[dict(zip(('id','target_store','target_locale','source_term','target_term','kind','support','alternatives'),r)) for r in rows]
-    if not batch: return {'processed':0,'remaining':0,'ids':[]}
-    try: results=glossary_ai.validate(batch)
-    except glossary_ai.AIError as exc: raise HTTPException(502,str(exc))
-    with pool.connection() as c:
-        for cid,r in results.items():
-            c.execute("UPDATE glossary_candidates SET ai_verdict=%s,ai_term=%s,ai_reason=%s,ai_checked_at=now() WHERE id=%s AND status='pending'",(r['verdict'],r['term'] or None,r['reason'] or None,cid))
-    return {'processed':len(results),'remaining':max(remaining-len(batch),0),'ids':[b['id'] for b in batch]}
-
 @app.post('/api/glossary-candidates/apply-ai')
 def apply_ai_glossary_suggestions(x:AIApplyRequest,user=Depends(operator)):
-    """Aplica en bloque las sugerencias de la IA elegidas por la persona (aprobar y/o rechazar) sobre los pendientes filtrados."""
+    """Aplica en bloque las sugerencias guardadas elegidas por la persona (aprobar y/o rechazar) sobre los pendientes filtrados."""
     verdicts=[v for v in x.verdicts if v in ('approve','reject')]
     if not verdicts: raise HTTPException(400,'Elige qué sugerencias aplicar')
     where=["status='pending'","ai_verdict=ANY(%s)"]; params=[verdicts]
