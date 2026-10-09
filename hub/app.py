@@ -846,6 +846,11 @@ def slugify_handle(value:str)->str:
     text=unicodedata.normalize('NFKD',value or '').encode('ascii','ignore').decode().lower()
     return re.sub(r'-{2,}','-',re.sub(r'[^a-z0-9]+','-',text)).strip('-')[:255]
 
+def fold_accent_chars(value:str)->str:
+    import unicodedata
+    # Carácter a carácter para conservar la longitud original.
+    return ''.join((d[0] if (d:=unicodedata.normalize('NFD',ch)) and d[0].isascii() else ch) for ch in value)
+
 @app.post('/api/translate-cell')
 def translate_cell(x:CellTranslateRequest,user=Depends(operator)):
     if x.field_key=='handle':
@@ -917,8 +922,12 @@ def translate_cell(x:CellTranslateRequest,user=Depends(operator)):
             return target[:1].upper()+target[1:].lower()
         return target
     segments=re.split(r'(<[^>]+>)',text) if x.html else [text]
+    # Un slug llega sin tildes: el glosario debe coincidir sin distinguirlas.
+    fold_accents=x.field_key=='handle_text'
+    if fold_accents: terms=[(fold_accent_chars(s),t) for s,t in terms]
     for i,segment in enumerate(segments):
         if segment.startswith('<') and segment.endswith('>'): continue
+        if fold_accents: segment=fold_accent_chars(segment)
         for n,(source_term,target_term) in enumerate(terms):
             pattern=re.compile(r'(?<!\w)'+re.escape(source_term)+r'(?!\w)',re.IGNORECASE)
             def protect(match):
