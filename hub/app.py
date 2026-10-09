@@ -1036,12 +1036,13 @@ def save_shopify_translation(x:CellTranslation,user=Depends(operator)):
         if x.key not in {'title','body_html','handle','seo_title','seo_description','vendor','product_type'}:
             raise HTTPException(400,'El campo no está habilitado para traducción')
     else: raise HTTPException(400,'Tipo de recurso Shopify no admitido')
+    shopify_key={'seo_title':'meta_title','seo_description':'meta_description'}.get(x.key,x.key)
     resource_query='''query TranslationDigest($id:ID!) { translatableResource(resourceId:$id) { resourceId translatableContent { key value digest } } }'''
     resource=shopify_graphql(store['domain'],store['token'],resource_query,{'id':x.resource_id}).get('translatableResource')
-    digest=next((item.get('digest') for item in (resource or {}).get('translatableContent',[]) if item.get('key')==x.key),None)
+    digest=next((item.get('digest') for item in (resource or {}).get('translatableContent',[]) if item.get('key')==shopify_key),None)
     if not digest: raise HTTPException(409,'Shopify no ofrece un digest traducible para ese campo; comprueba el tipo de metacampo y los permisos')
     mutation='''mutation RegisterTranslation($id:ID!,$translations:[TranslationInput!]!) { translationsRegister(resourceId:$id,translations:$translations) { userErrors { field message } translations { key value locale } } }'''
-    result=shopify_graphql(store['domain'],store['token'],mutation,{'id':x.resource_id,'translations':[{'locale':x.locale,'key':x.key,'value':x.value,'translatableContentDigest':digest}]}).get('translationsRegister') or {}
+    result=shopify_graphql(store['domain'],store['token'],mutation,{'id':x.resource_id,'translations':[{'locale':x.locale,'key':shopify_key,'value':x.value,'translatableContentDigest':digest}]}).get('translationsRegister') or {}
     errors=result.get('userErrors',[])
     if errors: raise HTTPException(400,'Shopify: '+'; '.join(error.get('message','error') for error in errors)[:500])
     remember_manual_correction(x)
