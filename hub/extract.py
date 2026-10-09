@@ -1,6 +1,6 @@
 """Extrae pares ES -> idioma de tienda del catálogo publicado (solo lectura sobre Shopify).
 
-Uso: python -m hub.extract [TIENDA ...]
+Uso: python -m hub.extract [TIENDA ...]  (incluye los locales de traducción de ES: nl, pt-PT)
 Guarda los pares en historical_pairs; no toca memoria, glosario ni Shopify.
 """
 import re
@@ -89,10 +89,14 @@ def main(only):
             index.setdefault(key, product)
     print(f'ES: {len(source)} productos activos', flush=True)
     for code, store in sorted(stores.items()):
-        if code == 'ES' or (only and code not in only):
+        if only and code not in only:
             continue
-        for locale, profile in active_profiles(code).items():
+        for profile in active_profiles(code).values():
+            locale = profile['shopify_locale']
             if not profile['deepl_target']:
+                continue
+            # ES es la fuente: solo se extraen sus locales de traducción (nl, pt-PT), comparados con sus campos base.
+            if code == 'ES' and profile['role'] != 'translation':
                 continue
             target = fetch_products(store, locale if profile['role'] == 'translation' else None)
             stats = Counter(products=len(target))

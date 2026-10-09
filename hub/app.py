@@ -4,13 +4,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlencode
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field, field_validator
 from psycopg.types.json import Jsonb
 from .db import pool, initialize
 from .skufile import extract_skus
 from .quality import assess_translation, strip_added_quotes
 from .profiles import active_profiles, target_profile
+from . import glossary_ai
 
 def operator():
     # This service is intended to be reachable only on the trusted local network.
@@ -53,6 +54,15 @@ class GlossaryTerm(BaseModel):
     source_term:str=Field(min_length=1,max_length=500)
     target_term:str=Field(min_length=1,max_length=500)
     enabled:bool=True
+class AIValidateRequest(BaseModel):
+    store:str|None=None
+    locale:str|None=None
+    revalidate:bool=False
+    exclude_ids:list[int]=Field(default_factory=list,max_length=5000)
+class AIApplyRequest(BaseModel):
+    store:str|None=None
+    locale:str|None=None
+    verdicts:list[str]=Field(default_factory=list)
 class CandidateDecision(BaseModel):
     target_term:str=Field(min_length=1,max_length=500)
 class CellTranslateRequest(BaseModel):
@@ -64,7 +74,7 @@ class CellTranslateRequest(BaseModel):
     html:bool=False
     field_key:str=Field(min_length=1,max_length=255)
     metafield_type:str|None=None
-BATCH_BASE_FIELDS={'descriptionHtml','seo.title','seo.description'}
+BATCH_BASE_FIELDS={'title','handle','descriptionHtml','seo.title','seo.description'}
 class TranslationBatchRequest(BaseModel):
     sku:str=Field(min_length=1,max_length=120)
     # Optional campaign targeting. Without `fields` the batch keeps its original
@@ -259,12 +269,19 @@ def shell(title, body, active=''):
     links = ''.join(f'<a class="nav-link {"active" if key==active else ""}" href="{url}" {"aria-current=page" if key==active else ""}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{icons[key]}</svg>{label}</a>' for key,url,label in items)
     mark = '<span class="dotmark" aria-hidden="true">' + '<i></i>' * 9 + '</span>'
     body = body.replace('<main class="wrap">', '<main class="wrap" id="main-content" tabindex="-1">', 1)
-    return f'''<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#202121"><title>{html.escape(title)} · Newgarden Hub</title>{STYLE}</head><body><a class="skip-link" href="#main-content">Saltar al contenido</a><aside class="sidebar"><a class="brand" href="/" aria-label="Newgarden Content Hub, inicio">{mark}<span><strong translate="no">newgarden</strong><small>CONTENT HUB</small></span></a><nav aria-label="Navegación principal">{links}</nav><div class="sidebar-foot"><p>Contenido global.<br>Control en cada palabra.</p><span>NEWGARDEN / WORKSPACE</span></div></aside><div class="workspace"><header class="workspace-bar"><div class="breadcrumb"><span>Content Hub</span><span aria-hidden="true">/</span>{html.escape(title)}</div><span class="workspace-label">Espacio de trabajo interno</span></header>{body}<footer class="workspace-footer"><span>NEWGARDEN · CONTENT OPERATIONS</span><a href="/docs">Documentación API ↗</a></footer></div></body></html>'''
+    return f'''<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#202121"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><title>{html.escape(title)} · Newgarden Hub</title>{STYLE}</head><body><a class="skip-link" href="#main-content">Saltar al contenido</a><aside class="sidebar"><a class="brand" href="/" aria-label="Newgarden Content Hub, inicio">{mark}<span><strong translate="no">newgarden</strong><small>CONTENT HUB</small></span></a><nav aria-label="Navegación principal">{links}</nav><div class="sidebar-foot"><p>Contenido global.<br>Control en cada palabra.</p><span>NEWGARDEN / WORKSPACE</span></div></aside><div class="workspace"><header class="workspace-bar"><div class="breadcrumb"><span>Content Hub</span><span aria-hidden="true">/</span>{html.escape(title)}</div><span class="workspace-label">Espacio de trabajo interno</span></header>{body}<footer class="workspace-footer"><span>NEWGARDEN · CONTENT OPERATIONS</span><a href="/docs">Documentación API ↗</a></footer></div></body></html>'''
 
 @app.get('/health')
 def health():
     with pool.connection() as c: c.execute('SELECT 1')
     return {'status':'ok'}
+
+FAVICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#202121"/><g fill="#f4f4f0" transform="translate(5 5) scale(.82)"><circle cx="10" cy="10" r="4"/><circle cx="32" cy="10" r="4"/><circle cx="54" cy="10" r="4"/><circle cx="10" cy="32" r="4"/><circle cx="32" cy="32" r="5"/><circle cx="54" cy="32" r="4"/><circle cx="10" cy="54" r="4"/><circle cx="32" cy="54" r="4"/><circle cx="54" cy="54" r="4"/></g></svg>'
+
+@app.get('/favicon.svg',include_in_schema=False)
+@app.get('/favicon.ico',include_in_schema=False)
+def favicon():
+    return Response(FAVICON_SVG, media_type='image/svg+xml', headers={'Cache-Control':'public, max-age=86400'})
 
 @app.get('/',response_class=HTMLResponse)
 def home():
@@ -291,67 +308,94 @@ document.querySelector('#store-form').addEventListener('submit',async e=>{e.prev
 
 @app.get('/glossary',response_class=HTMLResponse)
 def glossary_page():
-    body='''<main class="wrap"><h1>Glosario y aprendizaje</h1><p class="lede">Las reglas se limitan a una tienda origen, su locale y una tienda destino. El locale principal de Shopify queda seleccionado por defecto; puedes elegir otro locale publicado.</p><p><a class="button secondary" href="/glossary/review">Revisar candidatos del catálogo</a></p><section class="card"><h2>Añadir término</h2><form id="term-form"><div class="grid"><div class="field"><label for="source-store">Tienda origen</label><select id="source-store" name="source_store" required></select></div><div class="field"><label for="source-locale">Idioma origen</label><select id="source-locale" name="source_locale" required disabled><option value="">Elige una tienda</option></select></div><div class="field"><label for="target-store">Tienda destino</label><select id="target-store" name="target_store" required></select></div><div class="field"><label for="target-locale">Idioma destino</label><select id="target-locale" name="target_locale" required disabled><option value="">Elige una tienda</option></select></div><div class="field"><label for="source-term">Término origen</label><input id="source-term" name="source_term" required></div><div class="field"><label for="target-term">Traducción preferida</label><input id="target-term" name="target_term" required></div></div><p id="locale-status" class="muted" role="status"></p><button id="save-term">Guardar término</button> <span id="term-status" class="status" role="status"></span></form></section><section class="card"><h2>Términos guardados</h2><div id="terms" tabindex="0" role="region" aria-label="Términos guardados">Cargando…</div></section></main><script>
+    body='''<main class="wrap"><h1>Glosario y aprendizaje</h1><p class="lede">Las reglas se limitan a una tienda origen, su locale y una tienda destino. El locale principal de Shopify queda seleccionado por defecto; puedes elegir otro locale publicado.</p><p><a class="button secondary" href="/glossary/review">Revisar candidatos del catálogo</a></p><section class="card"><h2>Añadir término</h2><form id="term-form"><div class="grid"><div class="field"><label for="source-store">Tienda origen</label><select id="source-store" name="source_store" required></select></div><div class="field"><label for="source-locale">Idioma origen</label><select id="source-locale" name="source_locale" required disabled><option value="">Elige una tienda</option></select></div><div class="field"><label for="target-store">Tienda destino</label><select id="target-store" name="target_store" required></select></div><div class="field"><label for="target-locale">Idioma destino</label><select id="target-locale" name="target_locale" required disabled><option value="">Elige una tienda</option></select></div><div class="field"><label for="source-term">Término origen</label><input id="source-term" name="source_term" required></div><div class="field"><label for="target-term">Traducción preferida</label><input id="target-term" name="target_term" required></div></div><p id="locale-status" class="muted" role="status"></p><button id="save-term">Guardar término</button> <span id="term-status" class="status" role="status"></span></form></section><section class="card"><h2>Términos guardados</h2><form id="term-search" class="grid"><div class="field"><label for="search-store">Tienda</label><select id="search-store"><option value="">Todas las tiendas</option></select></div><div class="field"><label for="search-q">Buscar término</label><input id="search-q" type="search" placeholder="Origen o traducción" autocomplete="off"></div></form><p id="terms-count" class="muted" role="status"></p><div id="terms" tabindex="0" role="region" aria-label="Términos guardados">Cargando…</div></section></main><script>
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));let stores=[];
 const sourceStore=document.querySelector('#source-store'),targetStore=document.querySelector('#target-store'),sourceLocale=document.querySelector('#source-locale'),targetLocale=document.querySelector('#target-locale'),localeStatus=document.querySelector('#locale-status');
-async function loadStores(){const r=await fetch('/api/stores'),data=await r.json();stores=data.filter(s=>s.active);const options=stores.map(s=>`<option value="${esc(s.code)}">${esc(s.code)} · ${esc(s.domain)}</option>`).join('');sourceStore.innerHTML=options;targetStore.innerHTML=options;await Promise.all([loadLocales(sourceStore.value,sourceLocale),loadLocales(targetStore.value,targetLocale)]);}
+async function loadStores(){const r=await fetch('/api/stores'),data=await r.json();stores=data.filter(s=>s.active);const options=stores.map(s=>`<option value="${esc(s.code)}">${esc(s.code)} · ${esc(s.domain)}</option>`).join('');sourceStore.innerHTML=options;targetStore.innerHTML=options;document.querySelector('#search-store').innerHTML='<option value="">Todas las tiendas</option>'+stores.map(s=>`<option value="${esc(s.code)}">${esc(s.code)}</option>`).join('');await Promise.all([loadLocales(sourceStore.value,sourceLocale),loadLocales(targetStore.value,targetLocale)]);}
 async function loadLocales(code,select){select.disabled=true;select.innerHTML='<option value="">Consultando Shopify…</option>';try{const r=await fetch('/api/stores/'+encodeURIComponent(code)+'/shop-locales'),data=await r.json();if(!r.ok)throw new Error(data.detail||'Shopify no devolvió los idiomas');const shopLocales=data.filter(x=>x.published);const configured=stores.find(s=>s.code===code)?.locales||[];const choices=shopLocales.filter(x=>configured.includes(x.locale));if(!choices.length)throw new Error('No hay locales publicados y configurados a la vez. Configúralos en Tiendas.');select.innerHTML=choices.map(x=>`<option value="${esc(x.locale)}">${esc(x.locale)}${x.primary?' · principal':''}</option>`).join('');const primary=choices.find(x=>x.primary);select.value=(primary||choices[0]).locale;select.disabled=false;localeStatus.textContent='Locales publicados en Shopify; el principal está marcado y seleccionado por defecto.';return true}catch(error){select.innerHTML='<option value="">No se pudieron validar los locales</option>';select.disabled=true;localeStatus.textContent=error.message+' · Revisa la conexión y los permisos read_locales en Tiendas.';return false}}
 sourceStore.addEventListener('change',()=>loadLocales(sourceStore.value,sourceLocale));targetStore.addEventListener('change',()=>loadLocales(targetStore.value,targetLocale));
-async function loadTerms(){const r=await fetch('/api/glossary');let d;try{d=await r.json()}catch{document.querySelector('#terms').textContent='La API devolvió una respuesta no válida';return}if(!r.ok){document.querySelector('#terms').textContent=d.detail||'No se pudo cargar el glosario';return}document.querySelector('#terms').innerHTML=d.terms.length?'<table><tr><th>Tienda origen</th><th>Idioma</th><th>Tienda destino</th><th>Idioma</th><th>Término</th><th>Traducción</th><th>Acciones</th></tr>'+d.terms.map(t=>`<tr><td>${esc(t.source_store||'Todas (regla antigua)')}</td><td>${esc(t.source_locale)}</td><td>${esc(t.target_store||'Todas (regla antigua)')}</td><td>${esc(t.target_locale)}</td><td>${esc(t.source_term)}</td><td>${esc(t.target_term)}</td><td><button class="secondary" onclick="removeTerm(${t.id})">Eliminar</button></td></tr>`).join('')+'</table>':'<p class="muted">Aún no hay términos.</p>'}
+async function loadTerms(){const qs=new URLSearchParams();const ss=document.querySelector('#search-store').value,sq=document.querySelector('#search-q').value.trim();if(ss)qs.set('store',ss);if(sq)qs.set('q',sq);const r=await fetch('/api/glossary?'+qs);let d;try{d=await r.json()}catch{document.querySelector('#terms').textContent='La API devolvió una respuesta no válida';return}if(!r.ok){document.querySelector('#terms').textContent=d.detail||'No se pudo cargar el glosario';return}document.querySelector('#terms').innerHTML=d.terms.length?'<table><tr><th>Tienda origen</th><th>Idioma</th><th>Tienda destino</th><th>Idioma</th><th>Término</th><th>Traducción</th><th>Acciones</th></tr>'+d.terms.map(t=>`<tr><td>${esc(t.source_store||'Todas (regla antigua)')}</td><td>${esc(t.source_locale)}</td><td>${esc(t.target_store||'Todas (regla antigua)')}</td><td>${esc(t.target_locale)}</td><td>${esc(t.source_term)}</td><td>${esc(t.target_term)}</td><td><button class="secondary" onclick="removeTerm(${t.id})">Eliminar</button></td></tr>`).join('')+'</table>':'<p class="muted">'+(ss||sq?'Ningún término coincide con la búsqueda.':'Aún no hay términos.')+'</p>';document.querySelector('#terms-count').textContent=d.terms.length+' términos'}
 async function removeTerm(id){const r=await fetch('/api/glossary/'+id,{method:'DELETE'});if(r.ok)loadTerms()}
-document.querySelector('#term-form').addEventListener('submit',async e=>{e.preventDefault();const save=document.querySelector('#save-term');save.disabled=true;const data=Object.fromEntries(new FormData(e.target));const r=await fetch('/api/glossary',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});let result={};try{result=await r.json()}catch{}document.querySelector('#term-status').textContent=r.ok?'Guardado':(result.detail||'No se pudo guardar');save.disabled=false;if(r.ok){document.querySelector('#source-term').value='';document.querySelector('#target-term').value='';loadTerms()}});loadStores();loadTerms();
+document.querySelector('#term-form').addEventListener('submit',async e=>{e.preventDefault();const save=document.querySelector('#save-term');save.disabled=true;const data=Object.fromEntries(new FormData(e.target));const r=await fetch('/api/glossary',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});let result={};try{result=await r.json()}catch{}document.querySelector('#term-status').textContent=r.ok?'Guardado':(result.detail||'No se pudo guardar');save.disabled=false;if(r.ok){document.querySelector('#source-term').value='';document.querySelector('#target-term').value='';loadTerms()}});let tTimer;document.querySelector('#term-search').addEventListener('submit',e=>e.preventDefault());document.querySelector('#search-store').addEventListener('change',loadTerms);document.querySelector('#search-q').addEventListener('input',()=>{clearTimeout(tTimer);tTimer=setTimeout(loadTerms,300)});loadStores();loadTerms();
 </script>'''
     return shell('Glosario',body,'glossary')
 
 @app.get('/glossary/review',response_class=HTMLResponse)
 def glossary_review_page():
-    body="""<main class="wrap"><h1>Revisión de candidatos de glosario</h1><p class="lede">Términos propuestos a partir del catálogo ya traducido. Elige el valor canónico de cada tienda (puedes escribir otro o tomar una alternativa) y apruébalo para que se aplique en las traducciones. Nada se aplica hasta aprobarlo.</p><section class="card"><form id="filters"><div class="grid"><div class="field"><label for="f-store">Tienda destino</label><select id="f-store"></select></div><div class="field"><label for="f-status">Estado</label><select id="f-status"><option value="pending">Pendientes</option><option value="approved">Aprobados</option><option value="rejected">Rechazados</option><option value="">Todos</option></select></div><div class="field"><label for="f-kind">Tipo</label><select id="f-kind"><option value="">Todos</option><option value="term">Traducciones</option><option value="invariant">No traducir (nombres, modelos)</option></select></div><div class="field"><label for="f-conflicts">Inconsistencias</label><select id="f-conflicts"><option value="">Todas</option><option value="1">Solo con alternativas</option></select></div></div></form><p id="summary" class="muted" role="status"></p></section><section class="card"><div id="candidates" tabindex="0" role="region" aria-label="Candidatos de glosario">Cargando…</div></section></main><script>
+    body="""<main class="wrap"><h1>Revisión de candidatos de glosario</h1><p class="lede">Términos propuestos a partir del catálogo ya traducido. Elige el valor canónico de cada tienda (puedes escribir otro o tomar una alternativa) y apruébalo para que se aplique en las traducciones. Nada se aplica hasta aprobarlo.</p><section class="card"><form id="filters"><div class="grid"><div class="field"><label for="f-store">Tienda · idioma destino</label><select id="f-store"></select></div><div class="field"><label for="f-q">Buscar término</label><input id="f-q" type="search" placeholder="Término ES, traducción o alternativa" autocomplete="off"></div><div class="field"><label for="f-status">Estado</label><select id="f-status"><option value="pending">Pendientes</option><option value="approved">Aprobados</option><option value="rejected">Rechazados</option><option value="">Todos</option></select></div><div class="field"><label for="f-kind">Tipo</label><select id="f-kind"><option value="">Todos</option><option value="term">Traducciones</option><option value="invariant">No traducir (nombres, modelos)</option></select></div><div class="field"><label for="f-conflicts">Inconsistencias</label><select id="f-conflicts"><option value="">Todas</option><option value="1">Solo con alternativas</option></select></div><div class="field"><label for="f-ai">Sugerencia de IA</label><select id="f-ai"><option value="">Todas</option><option value="none">Sin validar</option><option value="approve">Aprobar</option><option value="reject">Rechazar</option><option value="review">Revisar a mano</option></select></div></div></form><p id="summary" class="muted" role="status"></p><div class="toolbar"><button type="button" id="ai-run">Validar pendientes con IA</button> <button type="button" class="secondary" id="ai-apply">Aplicar sugerencias de IA</button> <span id="ai-status" class="status" role="status"></span></div></section><section class="card"><div id="candidates" tabindex="0" role="region" aria-label="Candidatos de glosario">Cargando…</div></section></main><script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
-const box=document.querySelector('#candidates'),summary=document.querySelector('#summary'),ids=['#f-store','#f-status','#f-kind','#f-conflicts'];
+const box=document.querySelector('#candidates'),summary=document.querySelector('#summary'),ids=['#f-store','#f-status','#f-kind','#f-conflicts','#f-ai'];let aiEnabled=false;
 const badge={pending:'Pendiente',approved:'Aprobado',rejected:'Rechazado'};
-async function load(){const q=new URLSearchParams();const v=id=>document.querySelector(id).value;if(v('#f-store'))q.set('store',v('#f-store'));if(v('#f-status'))q.set('status',v('#f-status'));if(v('#f-kind'))q.set('kind',v('#f-kind'));if(v('#f-conflicts'))q.set('conflicts','1');
+const aiLabel={approve:'IA: aprobar',reject:'IA: rechazar',review:'IA: revisar'};
+const aiCell=c=>c.ai_verdict?`<span class="badge">${aiLabel[c.ai_verdict]}</span>${c.ai_verdict==='approve'&&c.ai_term&&c.ai_term!==c.target_term?`<br><button type="button" class="secondary pick" data-term="${esc(c.ai_term)}">${esc(c.ai_term)}</button>`:''}${c.ai_reason?`<br><small class="muted">${esc(c.ai_reason)}</small>`:''}`:'<small class="muted">Sin validar</small>';
+const post=async(url,body)=>{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||'La petición falló');return d};
+const scope=()=>{const [store,locale]=document.querySelector('#f-store').value.split('|');return {store:store||null,locale:locale||null}};
+let busy=false;
+document.querySelector('#ai-run').addEventListener('click',async e=>{if(busy)return;const st=document.querySelector('#ai-status');if(!aiEnabled){st.textContent='Falta ANTHROPIC_API_KEY en .env';return}busy=true;e.target.disabled=true;let done=0;const seen=[];try{while(true){const d=await post('/api/glossary-candidates/ai-validate',{...scope(),exclude_ids:seen});if(!d.ids.length)break;seen.push(...d.ids);done+=d.processed;st.textContent='Validados '+done+' · quedan '+d.remaining+'…';if(!d.remaining)break}st.textContent='Validación terminada: '+done+' candidatos. Revisa y aplica las sugerencias.'}catch(err){st.textContent=err.message+(done?' · ya validados: '+done:'')}busy=false;e.target.disabled=false;load()});
+document.querySelector('#ai-apply').addEventListener('click',async()=>{if(busy)return;const st=document.querySelector('#ai-status');const sc=scope();const label=sc.store?sc.store+' · '+sc.locale:'todas las tiendas';const verdicts=[];if(confirm('¿Aprobar en el glosario los pendientes que la IA sugiere aprobar ('+label+')? Se usará el valor propuesto por la IA.'))verdicts.push('approve');if(confirm('¿Rechazar también los pendientes que la IA sugiere rechazar ('+label+')?'))verdicts.push('reject');if(!verdicts.length)return;busy=true;try{const d=await post('/api/glossary-candidates/apply-ai',{...sc,verdicts});st.textContent='Aprobados: '+d.approved+' · rechazados: '+d.rejected}catch(err){st.textContent=err.message}busy=false;load()});
+let qTimer;document.querySelector('#f-q').addEventListener('input',()=>{clearTimeout(qTimer);qTimer=setTimeout(load,300)});
+async function load(){const q=new URLSearchParams();const v=id=>document.querySelector(id).value;if(v('#f-store')){const [st,lo]=v('#f-store').split('|');q.set('store',st);q.set('locale',lo)}if(v('#f-q').trim())q.set('q',v('#f-q').trim());if(v('#f-ai'))q.set('ai',v('#f-ai'));if(v('#f-status'))q.set('status',v('#f-status'));if(v('#f-kind'))q.set('kind',v('#f-kind'));if(v('#f-conflicts'))q.set('conflicts','1');
  let d;try{const r=await fetch('/api/glossary-candidates?'+q);d=await r.json();if(!r.ok)throw new Error(d.detail||'No se pudieron cargar los candidatos')}catch(e){box.textContent=e.message;return}
- const sel=document.querySelector('#f-store');if(sel.dataset.ready!=='1'){sel.innerHTML='<option value="">Todas</option>'+d.stores.map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join('');sel.dataset.ready='1'}
+ aiEnabled=d.ai_enabled;const sel=document.querySelector('#f-store');if(sel.dataset.ready!=='1'){sel.innerHTML='<option value="">Todas</option>'+d.targets.map(t=>`<option value="${esc(t.store+'|'+t.locale)}">${esc(t.store)} · ${esc(t.locale)}</option>`).join('');sel.dataset.ready='1'}
  summary.textContent=d.candidates.length+' candidatos · '+Object.entries(d.counts).map(([k,n])=>(badge[k]||k)+': '+n).join(' · ');
- if(!d.candidates.length){box.innerHTML='<p class="muted">No hay candidatos con estos filtros.</p>';return}
- box.innerHTML='<table><tr><th>Tienda · idioma</th><th>Término ES</th><th>Valor canónico</th><th>Alternativas detectadas</th><th>Evidencia</th><th>Estado</th><th>Acciones</th></tr>'+d.candidates.map(c=>{
+ if(!d.candidates.length){box.innerHTML='<p class="muted">No hay candidatos con estos filtros.'+(v('#f-store')&&!Object.keys(d.counts).length?' Este idioma aún no tiene candidatos: se generan con <code>python -m hub.mine</code> a partir de traducciones históricas.':'')+'</p>';return}
+ box.innerHTML='<table><tr><th>Tienda · idioma</th><th>Término ES</th><th>Valor canónico</th><th>Alternativas detectadas</th><th>Evidencia</th><th>IA</th><th>Estado</th><th>Acciones</th></tr>'+d.candidates.map(c=>{
   const alts=[{term:c.original_term,support:c.support,dice:c.dice,main:true},...c.alternatives.map(a=>({term:a.term,support:a.support,dice:a.dice}))];
   const locked=c.status!=='pending';
-  return `<tr data-id="${c.id}"><td>${esc(c.target_store)} · ${esc(c.target_locale)}</td><td><strong>${esc(c.source_term)}</strong>${c.kind==='invariant'?'<br><span class="badge">No traducir</span>':''}</td><td><input class="canon" value="${esc(c.target_term)}" aria-label="Valor canónico de ${esc(c.source_term)}" ${locked?'disabled':''}>${c.existing&&c.existing!==c.target_term?`<br><small class="muted">En glosario: ${esc(c.existing)}</small>`:''}</td><td>${locked?'':alts.map(a=>`<button type="button" class="secondary pick" data-term="${esc(a.term)}" title="${a.support} productos · afinidad ${a.dice}">${esc(a.term)} <small>(${a.support})</small></button>`).join(' ')}</td><td>${c.support} de ${c.source_products} productos<br><small class="muted">afinidad ${c.dice}</small></td><td><span class="badge">${esc(badge[c.status]||c.status)}</span></td><td class="actions">${c.status==='pending'?'<button type="button" class="approve">Aprobar</button> <button type="button" class="secondary reject">Rechazar</button>':'<button type="button" class="secondary reopen">Reabrir</button>'}<span class="status" role="status"></span></td></tr>`}).join('')+'</table>'}
+  return `<tr data-id="${c.id}"><td>${esc(c.target_store)} · ${esc(c.target_locale)}</td><td><strong>${esc(c.source_term)}</strong>${c.kind==='invariant'?'<br><span class="badge">No traducir</span>':''}</td><td><input class="canon" value="${esc(c.target_term)}" aria-label="Valor canónico de ${esc(c.source_term)}" ${locked?'disabled':''}>${c.existing&&c.existing!==c.target_term?`<br><small class="muted">En glosario: ${esc(c.existing)}</small>`:''}</td><td>${locked?'':alts.map(a=>`<button type="button" class="secondary pick" data-term="${esc(a.term)}" title="${a.support} productos · afinidad ${a.dice}">${esc(a.term)} <small>(${a.support})</small></button>`).join(' ')}</td><td>${c.support} de ${c.source_products} productos<br><small class="muted">afinidad ${c.dice}</small></td><td>${aiCell(c)}</td><td><span class="badge">${esc(badge[c.status]||c.status)}</span></td><td class="actions">${c.status==='pending'?'<button type="button" class="approve">Aprobar</button> <button type="button" class="secondary reject">Rechazar</button>':'<button type="button" class="secondary reopen">Reabrir</button>'}<span class="status" role="status"></span></td></tr>`}).join('')+'</table>'}
 box.addEventListener('click',async e=>{const row=e.target.closest('tr[data-id]');if(!row)return;const status=row.querySelector('.status'),input=row.querySelector('.canon');
  const pick=e.target.closest('.pick');if(pick){input.value=pick.dataset.term;return}
  const action=['approve','reject','reopen'].find(a=>e.target.classList.contains(a));if(!action)return;
  const button=e.target;button.disabled=true;status.textContent='';
  try{const r=await fetch(`/api/glossary-candidates/${row.dataset.id}/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target_term:input.value.trim()||'-'})});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||'No se pudo guardar');load()}catch(err){status.textContent=err.message;button.disabled=false}});
-for(const id of ids)document.querySelector(id).addEventListener('change',load);load();
+document.querySelector('#filters').addEventListener('submit',e=>e.preventDefault());for(const id of ids)document.querySelector(id).addEventListener('change',load);load();
 </script>"""
     return shell('Revisión de glosario',body,'glossary')
 
 @app.get('/api/glossary-candidates')
-def list_glossary_candidates(store:str|None=None,status:str|None=None,kind:str|None=None,conflicts:str|None=None,user=Depends(operator)):
+def list_glossary_candidates(store:str|None=None,locale:str|None=None,status:str|None=None,kind:str|None=None,conflicts:str|None=None,q:str|None=None,ai:str|None=None,user=Depends(operator)):
     where=[]; params=[]
     if store: where.append('c.target_store=%s'); params.append(store)
+    if locale: where.append('lower(c.target_locale)=lower(%s)'); params.append(locale)
     if status: where.append('c.status=%s'); params.append(status)
+    if q and q.strip():
+        where.append("(c.source_term ILIKE %s OR c.target_term ILIKE %s OR c.alternatives::text ILIKE %s)"); like='%'+q.strip().replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'; params+= [like,like,like]
+    if ai=='none': where.append('c.ai_verdict IS NULL')
+    elif ai in ('approve','reject','review'): where.append('c.ai_verdict=%s'); params.append(ai)
     if kind: where.append('c.kind=%s'); params.append(kind)
     if conflicts: where.append("jsonb_array_length(c.alternatives)>0")
     clause=('WHERE '+' AND '.join(where)) if where else ''
     with pool.connection() as c:
         rows=c.execute(f"""SELECT c.id,c.target_store,c.target_locale,c.source_term,c.target_term,c.kind,c.support,c.source_products,c.dice,c.alternatives,c.status,
               (SELECT g.target_term FROM translation_glossary g WHERE g.source_store='ES' AND g.target_store=c.target_store AND lower(g.target_locale)=lower(c.target_locale)
-                 AND lower(g.source_term)=lower(c.source_term) AND g.enabled LIMIT 1)
+                 AND lower(g.source_term)=lower(c.source_term) AND g.enabled LIMIT 1),
+              c.ai_verdict,c.ai_term,c.ai_reason
             FROM glossary_candidates c {clause}
             ORDER BY (jsonb_array_length(c.alternatives)>0) DESC,c.support DESC,c.id LIMIT 500""",params).fetchall()
-        stores=[r[0] for r in c.execute('SELECT DISTINCT target_store FROM glossary_candidates ORDER BY 1').fetchall()]
-        counts=dict(c.execute('SELECT status,count(*) FROM glossary_candidates'+(' WHERE target_store=%s' if store else '')+' GROUP BY status',[store] if store else []).fetchall())
-    keys=('id','target_store','target_locale','source_term','target_term','kind','support','source_products','dice','alternatives','status','existing')
+        # Destinos = locales traducibles de los perfiles (incluye los de ES: nl, pt-PT…) + los que ya tienen candidatos.
+        targets=[{'store':r[0],'locale':r[1]} for r in c.execute("""SELECT store_code,shopify_locale FROM translation_profiles WHERE active AND deepl_target IS NOT NULL
+              UNION SELECT target_store,target_locale FROM glossary_candidates ORDER BY 1,2""").fetchall()]
+        cwhere=[]; cparams=[]
+        if store: cwhere.append('target_store=%s'); cparams.append(store)
+        if locale: cwhere.append('lower(target_locale)=lower(%s)'); cparams.append(locale)
+        counts=dict(c.execute('SELECT status,count(*) FROM glossary_candidates'+((' WHERE '+' AND '.join(cwhere)) if cwhere else '')+' GROUP BY status',cparams).fetchall())
+    keys=('id','target_store','target_locale','source_term','target_term','kind','support','source_products','dice','alternatives','status','existing','ai_verdict','ai_term','ai_reason')
     out=[dict(zip(keys,r)) for r in rows]
     for item in out: item['original_term']=item['target_term']
-    return {'candidates':out,'stores':stores,'counts':counts}
+    return {'candidates':out,'targets':targets,'counts':counts,'ai_enabled':glossary_ai.configured()}
 
 def _candidate_or_404(c,candidate_id):
     row=c.execute('SELECT id,target_store,target_locale,source_term,target_term,status FROM glossary_candidates WHERE id=%s FOR UPDATE',(candidate_id,)).fetchone()
     if not row: raise HTTPException(404,'Candidato no encontrado')
     return row
+
+def _approve_candidate(c,candidate_id,store,locale,source_term,term):
+    c.execute("""INSERT INTO translation_glossary(source_store,source_locale,target_store,target_locale,source_term,target_term,enabled,origin)
+      VALUES('ES','es-ES',%s,%s,%s,%s,true,'historical_review')
+      ON CONFLICT (source_store,source_locale,target_store,target_locale,(lower(source_term)))
+      WHERE source_store IS NOT NULL AND target_store IS NOT NULL
+      DO UPDATE SET target_term=EXCLUDED.target_term,enabled=true,origin=EXCLUDED.origin,updated_at=now()""",(store,locale,source_term,term))
+    c.execute("UPDATE glossary_candidates SET status='approved',target_term=%s WHERE id=%s",(term,candidate_id))
 
 @app.post('/api/glossary-candidates/{candidate_id}/approve')
 def approve_glossary_candidate(candidate_id:int,x:CandidateDecision,user=Depends(operator)):
@@ -359,13 +403,50 @@ def approve_glossary_candidate(candidate_id:int,x:CandidateDecision,user=Depends
     if not term: raise HTTPException(400,'Indica el valor canónico')
     with pool.connection() as c:
         _,store,locale,source_term,_,status=_candidate_or_404(c,candidate_id)
-        c.execute("""INSERT INTO translation_glossary(source_store,source_locale,target_store,target_locale,source_term,target_term,enabled,origin)
-          VALUES('ES','es-ES',%s,%s,%s,%s,true,'historical_review')
-          ON CONFLICT (source_store,source_locale,target_store,target_locale,(lower(source_term)))
-          WHERE source_store IS NOT NULL AND target_store IS NOT NULL
-          DO UPDATE SET target_term=EXCLUDED.target_term,enabled=true,origin=EXCLUDED.origin,updated_at=now()""",(store,locale,source_term,term))
-        c.execute("UPDATE glossary_candidates SET status='approved',target_term=%s WHERE id=%s",(term,candidate_id))
+        _approve_candidate(c,candidate_id,store,locale,source_term,term)
     return {'approved':True}
+
+AI_BATCH=25
+
+@app.post('/api/glossary-candidates/ai-validate')
+def ai_validate_glossary_candidates(x:AIValidateRequest,user=Depends(operator)):
+    """Valida con IA un lote de pendientes y guarda la sugerencia; devuelve cuántos faltan para poder iterar desde la UI."""
+    if not glossary_ai.configured(): raise HTTPException(400,'Falta configurar ANTHROPIC_API_KEY en .env')
+    where=["status='pending'"]; params=[]
+    if not x.revalidate: where.append('ai_verdict IS NULL')
+    if x.store: where.append('target_store=%s'); params.append(x.store)
+    if x.locale: where.append('lower(target_locale)=lower(%s)'); params.append(x.locale)
+    if x.exclude_ids: where.append('NOT (id = ANY(%s))'); params.append(x.exclude_ids)
+    clause=' AND '.join(where)
+    with pool.connection() as c:
+        rows=c.execute(f"SELECT id,target_store,target_locale,source_term,target_term,kind,support,alternatives FROM glossary_candidates WHERE {clause} ORDER BY support DESC,id LIMIT {AI_BATCH}",params).fetchall()
+        remaining=c.execute(f"SELECT count(*) FROM glossary_candidates WHERE {clause}",params).fetchone()[0]
+    batch=[dict(zip(('id','target_store','target_locale','source_term','target_term','kind','support','alternatives'),r)) for r in rows]
+    if not batch: return {'processed':0,'remaining':0,'ids':[]}
+    try: results=glossary_ai.validate(batch)
+    except glossary_ai.AIError as exc: raise HTTPException(502,str(exc))
+    with pool.connection() as c:
+        for cid,r in results.items():
+            c.execute("UPDATE glossary_candidates SET ai_verdict=%s,ai_term=%s,ai_reason=%s,ai_checked_at=now() WHERE id=%s AND status='pending'",(r['verdict'],r['term'] or None,r['reason'] or None,cid))
+    return {'processed':len(results),'remaining':max(remaining-len(batch),0),'ids':[b['id'] for b in batch]}
+
+@app.post('/api/glossary-candidates/apply-ai')
+def apply_ai_glossary_suggestions(x:AIApplyRequest,user=Depends(operator)):
+    """Aplica en bloque las sugerencias de la IA elegidas por la persona (aprobar y/o rechazar) sobre los pendientes filtrados."""
+    verdicts=[v for v in x.verdicts if v in ('approve','reject')]
+    if not verdicts: raise HTTPException(400,'Elige qué sugerencias aplicar')
+    where=["status='pending'","ai_verdict=ANY(%s)"]; params=[verdicts]
+    if x.store: where.append('target_store=%s'); params.append(x.store)
+    if x.locale: where.append('lower(target_locale)=lower(%s)'); params.append(x.locale)
+    approved=rejected=0
+    with pool.connection() as c:
+        rows=c.execute(f"SELECT id,target_store,target_locale,source_term,target_term,ai_verdict,ai_term FROM glossary_candidates WHERE {' AND '.join(where)} FOR UPDATE",params).fetchall()
+        for cid,store,locale,source_term,target_term,verdict,ai_term in rows:
+            if verdict=='approve':
+                _approve_candidate(c,cid,store,locale,source_term,(ai_term or target_term).strip()); approved+=1
+            else:
+                c.execute("UPDATE glossary_candidates SET status='rejected' WHERE id=%s",(cid,)); rejected+=1
+    return {'approved':approved,'rejected':rejected}
 
 @app.post('/api/glossary-candidates/{candidate_id}/reject')
 def reject_glossary_candidate(candidate_id:int,x:CandidateDecision|None=None,user=Depends(operator)):
@@ -472,7 +553,7 @@ form.addEventListener('submit',async event=>{{event.preventDefault();if(!editTar
 
 @app.get('/products/batch',response_class=HTMLResponse)
 def batch_products_page():
-    body='''<main class="wrap"><h1>Campaña de traducción por SKU</h1><p class="lede">Elige varios SKU y, si quieres, solo los campos que te interesan para esta campaña. El servicio prepara las propuestas de un producto cada vez y las deja en <a href="/translation-batches">Revisión de lotes</a>. Nada se escribe en Shopify hasta que alguien revise, apruebe y aplique.</p><section class="card"><form id="batch-form"><div class="field"><label for="skus">SKU (uno por línea o separados por coma)</label><textarea id="skus" required maxlength="200000" placeholder="NG-1234&#10;NG-5678"></textarea></div><div class="field"><label for="sku-file">…o carga un archivo Excel (.xlsx), CSV o TXT con los SKU</label><input id="sku-file" type="file" accept=".xlsx,.xlsm,.csv,.txt"><p class="muted">Se usa la columna con cabecera “SKU”; si no la hay, la primera columna. Los SKU leídos se añaden al cuadro de arriba para que puedas revisarlos. Máximo 5.000 SKU.</p></div><div class="grid"><div class="field"><label for="target-store">Tienda destino</label><select id="target-store" disabled><option>Cargando tiendas…</option></select></div><div class="field"><label for="target-locale">Locale destino</label><select id="target-locale" disabled><option value="">Todos los locales</option></select></div></div><fieldset class="field"><legend>Campos a traducir</legend><label><input type="checkbox" class="field-choice" value="descriptionHtml" checked style="width:auto"> Descripción</label><br><label><input type="checkbox" class="field-choice" value="seo.title" checked style="width:auto"> SEO · título</label><br><label><input type="checkbox" class="field-choice" value="seo.description" checked style="width:auto"> SEO · descripción</label><br><label><input type="checkbox" class="field-choice" value="metafields" style="width:auto"> Todos los metacampos (producto y variantes)</label><div id="meta-picker" class="field"><p class="muted" id="meta-status">Cargando metacampos de ES…</p></div><details class="field"><summary>Añadir metacampos a mano</summary><label for="meta-fields">Metacampos adicionales (<code>namespace.key</code>, uno por línea)</label><textarea id="meta-fields" rows="3" maxlength="4000" placeholder="custom.ficha_tecnica"></textarea></details><label><input type="checkbox" id="variant-only" checked style="width:auto"> Metacampos de variante: solo las variantes de los SKU indicados (si no, se traducen las de todas las variantes del producto)</label></fieldset><p id="batch-status" class="muted" role="status" aria-live="polite"></p><div class="actions"><button id="prepare-batch" type="submit">Preparar lotes para revisión</button><button id="cancel-batch" type="button" class="secondary" hidden>Detener</button><a class="button secondary" href="/products">Volver al explorador</a></div><p class="muted">La preparación consulta Shopify y DeepL y guarda los lotes en el hub; no escribe en Shopify. Las listas largas se procesan automáticamente de 50 en 50 hasta terminar; mantén esta pestaña abierta mientras tanto.</p></form></section><section id="batch-results" aria-live="polite"></section></main><script>
+    body='''<main class="wrap"><h1>Campaña de traducción por SKU</h1><p class="lede">Elige varios SKU y, si quieres, solo los campos que te interesan para esta campaña. El servicio prepara las propuestas de un producto cada vez y las deja en <a href="/translation-batches">Revisión de lotes</a>. Nada se escribe en Shopify hasta que alguien revise, apruebe y aplique.</p><section class="card"><form id="batch-form"><div class="field"><label for="skus">SKU (uno por línea o separados por coma)</label><textarea id="skus" required maxlength="200000" placeholder="NG-1234&#10;NG-5678"></textarea></div><div class="field"><label for="sku-file">…o carga un archivo Excel (.xlsx), CSV o TXT con los SKU</label><input id="sku-file" type="file" accept=".xlsx,.xlsm,.csv,.txt"><p class="muted">Se usa la columna con cabecera “SKU”; si no la hay, la primera columna. Los SKU leídos se añaden al cuadro de arriba para que puedas revisarlos. Máximo 5.000 SKU.</p></div><div class="grid"><div class="field"><label for="target-store">Tienda destino</label><select id="target-store" disabled><option>Cargando tiendas…</option></select></div><div class="field"><label for="target-locale">Locale destino</label><select id="target-locale" disabled><option value="">Todos los locales</option></select></div></div><fieldset class="field"><legend>Campos a traducir</legend><label><input type="checkbox" class="field-choice" value="title" checked style="width:auto"> Título</label><br><label><input type="checkbox" class="field-choice" value="handle" checked style="width:auto"> Slug (handle)</label><br><label><input type="checkbox" class="field-choice" value="descriptionHtml" checked style="width:auto"> Descripción</label><br><label><input type="checkbox" class="field-choice" value="seo.title" checked style="width:auto"> SEO · título</label><br><label><input type="checkbox" class="field-choice" value="seo.description" checked style="width:auto"> SEO · descripción</label><br><label><input type="checkbox" class="field-choice" value="metafields" style="width:auto"> Todos los metacampos (producto y variantes)</label><div id="meta-picker" class="field"><p class="muted" id="meta-status">Cargando metacampos de ES…</p></div><details class="field"><summary>Añadir metacampos a mano</summary><label for="meta-fields">Metacampos adicionales (<code>namespace.key</code>, uno por línea)</label><textarea id="meta-fields" rows="3" maxlength="4000" placeholder="custom.ficha_tecnica"></textarea></details><label><input type="checkbox" id="variant-only" checked style="width:auto"> Metacampos de variante: solo las variantes de los SKU indicados (si no, se traducen las de todas las variantes del producto)</label></fieldset><p id="batch-status" class="muted" role="status" aria-live="polite"></p><div class="actions"><button id="prepare-batch" type="submit">Preparar lotes para revisión</button><button id="cancel-batch" type="button" class="secondary" hidden>Detener</button><a class="button secondary" href="/products">Volver al explorador</a></div><p class="muted">La preparación consulta Shopify y DeepL y guarda los lotes en el hub; no escribe en Shopify. Las listas largas se procesan automáticamente de 50 en 50 hasta terminar; mantén esta pestaña abierta mientras tanto.</p></form></section><section id="batch-results" aria-live="polite"></section></main><script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const storeSelect=document.querySelector('#target-store'),localeSelect=document.querySelector('#target-locale'),status=document.querySelector('#batch-status'),results=document.querySelector('#batch-results');
 async function fetchJSON(url,options){const r=await fetch(url,options);let data={};try{data=await r.json()}catch{}if(!r.ok)throw new Error(typeof data.detail==='string'?data.detail:'Error al procesar la solicitud');return data}
@@ -485,7 +566,7 @@ function selectedFields(){const fields=[...document.querySelectorAll('.field-cho
 function addResult(sku,html,ok){const card=document.createElement('section');card.className='card';card.innerHTML=`<h2>SKU ${esc(sku)}</h2>${html}`;results.append(card)}
 const skuBox=document.querySelector('#skus'),cancelButton=document.querySelector('#cancel-batch');let cancelled=false;
 cancelButton.addEventListener('click',()=>{cancelled=true;cancelButton.disabled=true;status.textContent='Deteniendo tras el producto en curso…'});
-document.querySelector('#sku-file').addEventListener('change',async e=>{const file=e.target.files[0];if(!file)return;status.textContent='Leyendo '+file.name+'…';try{const data=await fetchJSON('/api/translation-batches/parse-skus?filename='+encodeURIComponent(file.name),{method:'POST',body:file});const current=skuBox.value.split(/[\n,]/).map(x=>x.trim()).filter(Boolean);skuBox.value=[...new Set([...current,...data.skus])].join(String.fromCharCode(10));status.textContent=data.count+' SKU leídos de '+file.name+'. Total en la lista: '+skuBox.value.split(String.fromCharCode(10)).length+'.'}catch(err){status.textContent=err.message}e.target.value=''});
+document.querySelector('#sku-file').addEventListener('change',async e=>{const file=e.target.files[0];if(!file)return;status.textContent='Leyendo '+file.name+'…';try{const data=await fetchJSON('/api/translation-batches/parse-skus?filename='+encodeURIComponent(file.name),{method:'POST',body:file});const current=skuBox.value.split(/[\\n,]/).map(x=>x.trim()).filter(Boolean);skuBox.value=[...new Set([...current,...data.skus])].join(String.fromCharCode(10));status.textContent=data.count+' SKU leídos de '+file.name+'. Total en la lista: '+skuBox.value.split(String.fromCharCode(10)).length+'.'}catch(err){status.textContent=err.message}e.target.value=''});
 document.querySelector('#batch-form').addEventListener('submit',async e=>{e.preventDefault();const skus=[...new Set(skuBox.value.replaceAll(',',String.fromCharCode(10)).split(String.fromCharCode(10)).map(x=>x.trim()).filter(Boolean))];if(!skus.length)return;if(skus.length>5000){status.textContent='El máximo es 5.000 SKU por ejecución.';return}const fields=selectedFields();if(!fields.length){status.textContent='Selecciona al menos un campo a traducir.';return}const run=document.querySelector('#prepare-batch');run.disabled=true;cancelled=false;cancelButton.disabled=false;cancelButton.hidden=false;results.replaceChildren();const base={fields};if(storeSelect.value)base.store=storeSelect.value;if(localeSelect.value)base.locale=localeSelect.value;base.variants_of_skus_only=document.querySelector('#variant-only').checked;const byProduct=new Map(),failed=[];let created=0,processed=0;
 for(let i=0;i<skus.length&&!cancelled;i+=50){const chunk=skus.slice(i,i+50);status.textContent='Resolviendo SKU '+(i+1)+'–'+(i+chunk.length)+' de '+skus.length+' en ES…';try{const resolved=await fetchJSON('/api/translation-batches/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({skus:chunk})});for(const g of resolved.groups){const known=byProduct.get(g.product_gid);if(known)known.skus.push(...g.skus);else byProduct.set(g.product_gid,{...g,skus:[...g.skus]})}for(const x of resolved.errors){failed.push(x.sku);addResult(x.sku,`<p class="batch-error" role="alert">${esc(x.error)}</p>`)}}catch(err){chunk.forEach(sku=>failed.push(sku));addResult(chunk[0]+' … '+chunk[chunk.length-1],`<p class="batch-error" role="alert">No se pudo resolver este bloque de ${chunk.length} SKU: ${esc(err.message)}</p>`)}}
 const groups=[...byProduct.values()];for(let i=0;i<groups.length&&!cancelled;i++){const g=groups[i];status.textContent='Preparando producto '+(i+1)+'/'+groups.length+' · '+g.skus.join(', ')+'…';try{const batch=await fetchJSON('/api/translation-batches',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...base,sku:g.skus[0],also_skus:g.skus.slice(1)})});const pending=batch.items.filter(x=>x.state==='PENDING_REVIEW').length,approved=batch.items.filter(x=>x.state==='APPROVED').length,errors=batch.items.filter(x=>x.state==='ERROR').length;created++;addResult(g.skus.join(', '),`<p>${esc(batch.source_title||g.title)}</p>${g.skus.length>1?`<p class="muted">Estos ${g.skus.length} SKU son del mismo producto: se ha creado un solo lote.</p>`:''}<p class="muted">${batch.items.length} campo(s): ${pending} pendientes de revisión, ${approved} aprobados automáticamente, ${errors} con error.</p>${batch.items.filter(x=>x.state==='ERROR').slice(0,3).map(x=>`<p class="batch-error">${esc(x.store)} · ${esc(x.locale)}: ${esc(x.error||'')}</p>`).join('')}<a class="button secondary" href="/translation-batches#${batch.id}">Abrir lote #${batch.id}</a>`)}catch(err){failed.push(...g.skus);addResult(g.skus.join(', '),`<p class="batch-error" role="alert">${esc(err.message)}</p>`)}}
@@ -791,9 +872,19 @@ def remember_manual_correction(x:CellTranslation):
         with pool.connection() as c:
             c.execute("INSERT INTO translation_memory(target_store,source_locale,target_locale,source_text,target_text) VALUES(%s,'es-ES',%s,%s,%s) ON CONFLICT(target_store,source_locale,target_locale,source_text) WHERE target_store IS NOT NULL DO UPDATE SET target_text=EXCLUDED.target_text,created_at=now()",(x.store,x.locale,src,dst))
 
+def slugify_handle(value:str)->str:
+    import unicodedata
+    text=unicodedata.normalize('NFKD',value or '').encode('ascii','ignore').decode().lower()
+    return re.sub(r'-{2,}','-',re.sub(r'[^a-z0-9]+','-',text)).strip('-')[:255]
+
 @app.post('/api/translate-cell')
 def translate_cell(x:CellTranslateRequest,user=Depends(operator)):
-    if x.field_key=='handle': raise HTTPException(400,'El handle requiere adaptación manual antes de guardarse')
+    if x.field_key=='handle':
+        # Traduce las palabras del slug y vuelve a normalizarlo a un handle válido.
+        words=translate_cell(x.model_copy(update={'source_text':x.source_text.replace('-',' ').strip(),'field_key':'handle_text','html':False}),user)
+        slug=slugify_handle(words['translation'])
+        if not slug: raise HTTPException(422,'La traducción del slug quedó vacía')
+        return {**words,'translation':slug}
     profile=target_profile(x.target_store,x.target_locale)
     if not profile: raise HTTPException(400,f'{x.target_store} · {x.target_locale} no tiene un perfil de traducción activo')
     if x.metafield_type in {'rich_text_field','list.single_line_text_field','list.multi_line_text_field'}:
@@ -884,12 +975,16 @@ def translate_cell(x:CellTranslateRequest,user=Depends(operator)):
     return {'translation':translated,'memory_hit':False,'glossary_terms':len(tokens),'require_review':profile['require_review']}
 
 @app.get('/api/glossary')
-def list_glossary(target_locale:str|None=None,user=Depends(operator)):
+def list_glossary(target_locale:str|None=None,store:str|None=None,q:str|None=None,user=Depends(operator)):
+    where=[]; params=[]
+    if target_locale: where.append('target_locale=%s'); params.append(target_locale)
+    if store: where.append('(source_store=%s OR target_store=%s)'); params+=[store,store]
+    if q and q.strip():
+        like='%'+q.strip().replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
+        where.append('(source_term ILIKE %s OR target_term ILIKE %s)'); params+=[like,like]
+    clause=('WHERE '+' AND '.join(where)) if where else ''
     with pool.connection() as c:
-        if target_locale:
-            rows=c.execute("SELECT id,source_store,source_locale,target_store,target_locale,source_term,target_term,enabled,origin FROM translation_glossary WHERE target_locale=%s ORDER BY source_store,target_store,source_term",(target_locale,)).fetchall()
-        else:
-            rows=c.execute("SELECT id,source_store,source_locale,target_store,target_locale,source_term,target_term,enabled,origin FROM translation_glossary ORDER BY source_store,target_store,target_locale,source_term").fetchall()
+        rows=c.execute(f"SELECT id,source_store,source_locale,target_store,target_locale,source_term,target_term,enabled,origin FROM translation_glossary {clause} ORDER BY source_store,target_store,target_locale,source_term",params).fetchall()
     return {'terms':[dict(zip(('id','source_store','source_locale','target_store','target_locale','source_term','target_term','enabled','origin'),r)) for r in rows]}
 
 @app.post('/api/glossary')
@@ -949,6 +1044,7 @@ def save_shopify_translation(x:CellTranslation,user=Depends(operator)):
         product={'id':x.resource_id}
         if seo_field: product['seo']={seo_field:x.value}
         else: product[field]=x.value
+        if x.key=='handle': product['redirectNewHandle']=True
         mutation='''mutation UpdateBaseProduct($product:ProductUpdateInput!) { productUpdate(product:$product) { userErrors { field message } } }'''
         result=shopify_graphql(store['domain'],store['token'],mutation,{'product':product}).get('productUpdate') or {}
         errors=result.get('userErrors',[])
@@ -1086,7 +1182,7 @@ def create_translation_batch(x:TranslationBatchRequest,user=Depends(operator)):
                 translated=translate_cell(request,user)
                 proposed=translated['translation']; error=None
                 quality=assess_translation(source_text,proposed,is_html=request.html)
-                state='APPROVED' if quality['status']=='PASS' and not translated.get('require_review') and os.getenv('QUALITY_AUTO_APPROVE','true').lower() in ('1','true','yes','on') else 'PENDING_REVIEW'
+                state='APPROVED' if quality['status']=='PASS' and not translated.get('require_review') and field['key']!='handle' and os.getenv('QUALITY_AUTO_APPROVE','true').lower() in ('1','true','yes','on') else 'PENDING_REVIEW'
             except Exception as exc:
                 proposed=None; quality=None; state='ERROR'; error=str(exc.detail if isinstance(exc,HTTPException) else exc)[:500]
             with pool.connection() as c:

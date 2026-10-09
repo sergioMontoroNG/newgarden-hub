@@ -78,6 +78,10 @@ Actualización: respaldar primero, obtener/revisar cambios del repositorio en es
 - No existe fallback API, compras de créditos, cron de reintento ni publicación automática. Shopify real está desactivado incluso si `SIMULATION=false`.
 - Las tareas `BLOCKED_MAPPING` no se ejecutan hasta importar una correspondencia con GID destino.
 
+## Estimación de caracteres a traducir
+
+`scripts/estimate_chars.py` (solo lectura) exporta el catálogo de ES con una operación masiva de Shopify y cuenta los caracteres de origen de los campos que traduce el hub (descripción sin etiquetas, SEO, metacampos de producto y de variante). Multiplica por los pares tienda·locale con perfil DeepL activo y muestra carga inicial y mantenimiento mensual hipotético. No descuenta memoria de traducción ni glosario. Ejecútalo con `docker compose exec -T app python - < scripts/estimate_chars.py`; añade `-- --help` tras `python -` para ver las opciones (`--limit`, `--skip`, `--rerun-factor`, `--json`).
+
 ## Desarrollo de la interfaz
 
 El sistema visual compartido está en `hub/ui.css`; `shell()` en `hub/app.py` construye la navegación y el marco de las páginas. El CSS se carga desde el paquete `hub`, que ya se incluye en la imagen Docker. No requiere compilación frontend ni fuentes externas. `PRODUCT.md` recoge el criterio de diseño.
