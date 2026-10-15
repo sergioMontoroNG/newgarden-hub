@@ -1,4 +1,4 @@
-import hashlib, json, os, html, re, time
+import hashlib, json, logging, os, html, re, threading, time
 import urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlencode
@@ -23,6 +23,10 @@ async def lifespan(app):
     with pool.connection() as c:
         c.execute("UPDATE localization_jobs j SET state=CASE WHEN EXISTS(SELECT 1 FROM localization_results r WHERE r.job_id=j.id AND r.output IS NOT NULL AND r.validation->>'ok'='true') THEN 'READY_FOR_REVIEW' ELSE 'PENDING' END, updated_at=now() WHERE state='RUNNING'")
         c.execute("UPDATE process_control SET state='STOPPED',updated_at=now() WHERE singleton AND state='RUNNING'")
+        # A product that was being prepared when the service stopped goes back to the queue.
+        c.execute("UPDATE translation_campaign_items SET state='PENDING',started_at=NULL WHERE state='RUNNING'")
+        c.execute("UPDATE translation_batches SET state='READY_WITH_ERRORS',error='Interrumpido por un reinicio del servicio',updated_at=now() WHERE state='PREPARING'")
+    threading.Thread(target=_campaign_runner,name='campaign-runner',daemon=True).start()
     yield
 
 app=FastAPI(title='Newgarden Content Hub',version='0.1.0',lifespan=lifespan)
@@ -257,11 +261,12 @@ def shell(title, body, active=''):
         'home': '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
         'products': '<path d="m12 3 9 5v8l-9 5-9-5V8l9-5Z"/><path d="m3 8 9 5 9-5M12 13v8M7.5 5.5l9 5"/>',
         'batch': '<rect x="7" y="7" width="14" height="14" rx="2"/><path d="M17 7V3H3v14h4M11 12h6M11 16h6"/>',
+        'campaigns': '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
         'review': '<path d="M4 4h16v16H4zM8 9h8M8 13h5"/><path d="m14 17 2 2 4-4"/>',
         'glossary': '<path d="M12 5v16M12 5C8 2 4 3 2 4v15c3-1 6-1 10 2 4-3 7-3 10-2V4c-3-1-6-2-10 1Z"/>',
         'stores': '<path d="M3 10v11h18V10M2 10l2-7h16l2 7M2 10h20M9 21v-7h6v7"/>',
     }
-    items = [('home','/','Resumen'),('products','/products','Gestión de productos'),('batch','/products/batch','Traducción en lote'),('review','/translation-batches','Revisión de lotes'),('glossary','/glossary','Glosario'),('stores','/stores','Tiendas')]
+    items = [('home','/','Resumen'),('products','/products','Gestión de productos'),('batch','/products/batch','Traducción en lote'),('campaigns','/translation-campaigns','Campañas'),('review','/translation-batches','Revisión de lotes'),('glossary','/glossary','Glosario'),('stores','/stores','Tiendas')]
     links = ''.join(f'<a class="nav-link {"active" if key==active else ""}" href="{url}" {"aria-current=page" if key==active else ""}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{icons[key]}</svg>{label}</a>' for key,url,label in items)
     mark = '<span class="dotmark" aria-hidden="true">' + '<i></i>' * 9 + '</span>'
     body = body.replace('<main class="wrap">', '<main class="wrap" id="main-content" tabindex="-1">', 1)
@@ -524,7 +529,7 @@ form.addEventListener('submit',async event=>{{event.preventDefault();if(!editTar
 
 @app.get('/products/batch',response_class=HTMLResponse)
 def batch_products_page():
-    body='''<main class="wrap"><h1>Campaña de traducción por SKU</h1><p class="lede">Elige varios SKU y, si quieres, solo los campos que te interesan para esta campaña. El servicio prepara las propuestas de un producto cada vez y las deja en <a href="/translation-batches">Revisión de lotes</a>. Por defecto las traducciones se escriben directamente en Shopify, donde se revisan después; si desmarcas esa opción, nada se escribe hasta que alguien revise, apruebe y aplique.</p><section class="card"><form id="batch-form"><div class="field"><label for="skus">SKU (uno por línea o separados por coma)</label><textarea id="skus" required maxlength="200000" placeholder="NG-1234&#10;NG-5678"></textarea></div><div class="field"><label for="sku-file">…o carga un archivo Excel (.xlsx), CSV o TXT con los SKU</label><input id="sku-file" type="file" accept=".xlsx,.xlsm,.csv,.txt"><p class="muted">Se usa la columna con cabecera “SKU”; si no la hay, la primera columna. Los SKU leídos se añaden al cuadro de arriba para que puedas revisarlos. Máximo 5.000 SKU.</p></div><div class="grid"><div class="field"><label for="target-store">Tienda destino</label><select id="target-store" disabled><option>Cargando tiendas…</option></select></div><div class="field"><label for="target-locale">Locale destino</label><select id="target-locale" disabled><option value="">Todos los locales</option></select></div></div><fieldset class="field"><legend>Campos a traducir</legend><label><input type="checkbox" class="field-choice" value="title" checked style="width:auto"> Título</label><br><label><input type="checkbox" class="field-choice" value="handle" checked style="width:auto"> Slug (handle)</label><br><label><input type="checkbox" class="field-choice" value="descriptionHtml" checked style="width:auto"> Descripción</label><br><label><input type="checkbox" class="field-choice" value="seo.title" checked style="width:auto"> SEO · título</label><br><label><input type="checkbox" class="field-choice" value="seo.description" checked style="width:auto"> SEO · descripción</label><br><label><input type="checkbox" class="field-choice" value="metafields" style="width:auto"> Todos los metacampos (producto y variantes)</label><div id="meta-picker" class="field"><p class="muted" id="meta-status">Cargando metacampos de ES…</p></div><details class="field"><summary>Añadir metacampos a mano</summary><label for="meta-fields">Metacampos adicionales (<code>namespace.key</code>, uno por línea)</label><textarea id="meta-fields" rows="3" maxlength="4000" placeholder="custom.ficha_tecnica"></textarea></details><label><input type="checkbox" id="variant-only" checked style="width:auto"> Metacampos de variante: solo las variantes de los SKU indicados (si no, se traducen las de todas las variantes del producto)</label></fieldset><fieldset class="field"><legend>Destino de las traducciones</legend><label><input type="checkbox" id="auto-apply" checked style="width:auto"> Traducir y subir directamente a Shopify (la revisión se hace en Shopify; los campos que no superen la calidad quedan pendientes en Revisión de lotes)</label></fieldset><p id="batch-status" class="muted" role="status" aria-live="polite"></p><div class="actions"><button id="prepare-batch" type="submit">Preparar lotes para revisión</button><button id="cancel-batch" type="button" class="secondary" hidden>Detener</button><a class="button secondary" href="/products">Volver al explorador</a></div><p class="muted">La preparación consulta Shopify y DeepL y guarda los lotes en el hub; con «subir directamente» también escribe las traducciones en Shopify. Las listas largas se procesan automáticamente de 50 en 50 hasta terminar; mantén esta pestaña abierta mientras tanto.</p></form></section><section id="batch-results" aria-live="polite"></section></main><script>
+    body='''<main class="wrap"><h1>Campaña de traducción por SKU</h1><p class="lede">Elige varios SKU y, si quieres, solo los campos que te interesan para esta campaña. El servicio prepara las propuestas de un producto cada vez, en segundo plano (puedes cerrar esta página), y las deja en <a href="/translation-batches">Revisión de lotes</a>. Sigue el avance en <a href="/translation-campaigns">Campañas</a>. Por defecto las traducciones se escriben directamente en Shopify, donde se revisan después; si desmarcas esa opción, nada se escribe hasta que alguien revise, apruebe y aplique.</p><section class="card"><form id="batch-form"><div class="field"><label for="skus">SKU (uno por línea o separados por coma)</label><textarea id="skus" required maxlength="200000" placeholder="NG-1234&#10;NG-5678"></textarea></div><div class="field"><label for="sku-file">…o carga un archivo Excel (.xlsx), CSV o TXT con los SKU</label><input id="sku-file" type="file" accept=".xlsx,.xlsm,.csv,.txt"><p class="muted">Se usa la columna con cabecera “SKU”; si no la hay, la primera columna. Los SKU leídos se añaden al cuadro de arriba para que puedas revisarlos. Máximo 5.000 SKU.</p></div><div class="grid"><div class="field"><label for="target-store">Tienda destino</label><select id="target-store" disabled><option>Cargando tiendas…</option></select></div><div class="field"><label for="target-locale">Locale destino</label><select id="target-locale" disabled><option value="">Todos los locales</option></select></div></div><fieldset class="field"><legend>Campos a traducir</legend><label><input type="checkbox" class="field-choice" value="title" checked style="width:auto"> Título</label><br><label><input type="checkbox" class="field-choice" value="handle" checked style="width:auto"> Slug (handle)</label><br><label><input type="checkbox" class="field-choice" value="descriptionHtml" checked style="width:auto"> Descripción</label><br><label><input type="checkbox" class="field-choice" value="seo.title" checked style="width:auto"> SEO · título</label><br><label><input type="checkbox" class="field-choice" value="seo.description" checked style="width:auto"> SEO · descripción</label><br><label><input type="checkbox" class="field-choice" value="metafields" style="width:auto"> Todos los metacampos (producto y variantes)</label><div id="meta-picker" class="field"><p class="muted" id="meta-status">Cargando metacampos de ES…</p></div><details class="field"><summary>Añadir metacampos a mano</summary><label for="meta-fields">Metacampos adicionales (<code>namespace.key</code>, uno por línea)</label><textarea id="meta-fields" rows="3" maxlength="4000" placeholder="custom.ficha_tecnica"></textarea></details><label><input type="checkbox" id="variant-only" checked style="width:auto"> Metacampos de variante: solo las variantes de los SKU indicados (si no, se traducen las de todas las variantes del producto)</label></fieldset><fieldset class="field"><legend>Destino de las traducciones</legend><label><input type="checkbox" id="auto-apply" checked style="width:auto"> Traducir y subir directamente a Shopify (la revisión se hace en Shopify; los campos que no superen la calidad quedan pendientes en Revisión de lotes)</label></fieldset><p id="batch-status" class="muted" role="status" aria-live="polite"></p><div class="actions"><button id="prepare-batch" type="submit">Preparar lotes para revisión</button><button id="cancel-batch" type="button" class="secondary" hidden>Detener</button><a class="button secondary" href="/products">Volver al explorador</a></div><p class="muted">La preparación consulta Shopify y DeepL y guarda los lotes en el hub; con «subir directamente» también escribe las traducciones en Shopify. Las listas largas se procesan automáticamente de 50 en 50 hasta terminar; mantén esta pestaña abierta mientras tanto.</p></form></section><section id="batch-results" aria-live="polite"></section></main><script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const storeSelect=document.querySelector('#target-store'),localeSelect=document.querySelector('#target-locale'),status=document.querySelector('#batch-status'),results=document.querySelector('#batch-results');
 async function fetchJSON(url,options){const r=await fetch(url,options);let data={};try{data=await r.json()}catch{}if(!r.ok)throw new Error(typeof data.detail==='string'?data.detail:'Error al procesar la solicitud');return data}
@@ -538,11 +543,7 @@ function addResult(sku,html,ok){const card=document.createElement('section');car
 const skuBox=document.querySelector('#skus'),cancelButton=document.querySelector('#cancel-batch');let cancelled=false;
 cancelButton.addEventListener('click',()=>{cancelled=true;cancelButton.disabled=true;status.textContent='Deteniendo tras el producto en curso…'});
 document.querySelector('#sku-file').addEventListener('change',async e=>{const file=e.target.files[0];if(!file)return;status.textContent='Leyendo '+file.name+'…';try{const data=await fetchJSON('/api/translation-batches/parse-skus?filename='+encodeURIComponent(file.name),{method:'POST',body:file});const current=skuBox.value.split(/[\\n,]/).map(x=>x.trim()).filter(Boolean);skuBox.value=[...new Set([...current,...data.skus])].join(String.fromCharCode(10));status.textContent=data.count+' SKU leídos de '+file.name+'. Total en la lista: '+skuBox.value.split(String.fromCharCode(10)).length+'.'}catch(err){status.textContent=err.message}e.target.value=''});
-document.querySelector('#batch-form').addEventListener('submit',async e=>{e.preventDefault();const skus=[...new Set(skuBox.value.replaceAll(',',String.fromCharCode(10)).split(String.fromCharCode(10)).map(x=>x.trim()).filter(Boolean))];if(!skus.length)return;if(skus.length>5000){status.textContent='El máximo es 5.000 SKU por ejecución.';return}const fields=selectedFields();if(!fields.length){status.textContent='Selecciona al menos un campo a traducir.';return}const run=document.querySelector('#prepare-batch');run.disabled=true;cancelled=false;cancelButton.disabled=false;cancelButton.hidden=false;results.replaceChildren();const base={fields};if(storeSelect.value)base.store=storeSelect.value;if(localeSelect.value)base.locale=localeSelect.value;base.variants_of_skus_only=document.querySelector('#variant-only').checked;base.auto_apply=document.querySelector('#auto-apply').checked;if(base.auto_apply&&!confirm('Las traducciones se escribirán directamente en Shopify sin revisión previa en el hub. ¿Continuar?')){run.disabled=false;cancelButton.hidden=true;return}const byProduct=new Map(),failed=[];let created=0,processed=0;
-for(let i=0;i<skus.length&&!cancelled;i+=50){const chunk=skus.slice(i,i+50);status.textContent='Resolviendo SKU '+(i+1)+'–'+(i+chunk.length)+' de '+skus.length+' en ES…';try{const resolved=await fetchJSON('/api/translation-batches/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({skus:chunk})});for(const g of resolved.groups){const known=byProduct.get(g.product_gid);if(known)known.skus.push(...g.skus);else byProduct.set(g.product_gid,{...g,skus:[...g.skus]})}for(const x of resolved.errors){failed.push(x.sku);addResult(x.sku,`<p class="batch-error" role="alert">${esc(x.error)}</p>`)}}catch(err){chunk.forEach(sku=>failed.push(sku));addResult(chunk[0]+' … '+chunk[chunk.length-1],`<p class="batch-error" role="alert">No se pudo resolver este bloque de ${chunk.length} SKU: ${esc(err.message)}</p>`)}}
-const groups=[...byProduct.values()];for(let i=0;i<groups.length&&!cancelled;i++){const g=groups[i];status.textContent='Preparando producto '+(i+1)+'/'+groups.length+' · '+g.skus.join(', ')+'…';try{const batch=await fetchJSON('/api/translation-batches',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...base,sku:g.skus[0],also_skus:g.skus.slice(1)})});const pending=batch.items.filter(x=>x.state==='PENDING_REVIEW').length,approved=batch.items.filter(x=>x.state==='APPROVED').length,errors=batch.items.filter(x=>x.state==='ERROR').length;created++;addResult(g.skus.join(', '),`<p>${esc(batch.source_title||g.title)}</p>${g.skus.length>1?`<p class="muted">Estos ${g.skus.length} SKU son del mismo producto: se ha creado un solo lote.</p>`:''}<p class="muted">${batch.items.length} campo(s): ${batch.items.filter(x=>x.state==='SAVED').length} subidos a Shopify, ${pending} pendientes de revisión, ${approved} aprobados sin aplicar, ${errors+batch.items.filter(x=>x.state==='APPLY_ERROR').length} con error.</p>${batch.items.filter(x=>x.state==='ERROR').slice(0,3).map(x=>`<p class="batch-error">${esc(x.store)} · ${esc(x.locale)}: ${esc(x.error||'')}</p>`).join('')}<a class="button secondary" href="/translation-batches#${batch.id}">Abrir lote #${batch.id}</a>`)}catch(err){failed.push(...g.skus);addResult(g.skus.join(', '),`<p class="batch-error" role="alert">${esc(err.message)}</p>`)}}
-run.disabled=false;cancelButton.hidden=true;status.textContent=(cancelled?'Detenido. ':'Terminado. ')+created+' lote(s) preparados de '+groups.length+' producto(s) resueltos; '+failed.length+' SKU con error.'+(cancelled?' Los SKU no procesados no se han marcado como fallidos: vuelve a lanzar la lista para completarlos.':'')+' Revísalos en Revisión de lotes.';
-if(failed.length){const box=document.createElement('section');box.className='card';box.innerHTML='<h2>SKU con error</h2><p class="muted">Copia esta lista o recárgala en el cuadro de SKU para reintentar.</p><textarea readonly rows="4" style="width:100%"></textarea><div class="actions"><button type="button" class="secondary">Cargar en el cuadro de SKU</button></div>';box.querySelector('textarea').value=[...new Set(failed)].join(String.fromCharCode(10));box.querySelector('button').addEventListener('click',()=>{skuBox.value=[...new Set(failed)].join(String.fromCharCode(10));window.scrollTo({top:0,behavior:'smooth'})});results.prepend(box)}});
+document.querySelector('#batch-form').addEventListener('submit',async e=>{e.preventDefault();const skus=[...new Set(skuBox.value.replaceAll(',',String.fromCharCode(10)).split(String.fromCharCode(10)).map(x=>x.trim()).filter(Boolean))];if(!skus.length)return;if(skus.length>5000){status.textContent='El máximo es 5.000 SKU por ejecución.';return}const fields=selectedFields();if(!fields.length){status.textContent='Selecciona al menos un campo a traducir.';return}const body={skus,fields,variants_of_skus_only:document.querySelector('#variant-only').checked,auto_apply:document.querySelector('#auto-apply').checked};if(storeSelect.value)body.store=storeSelect.value;if(localeSelect.value)body.locale=localeSelect.value;if(body.auto_apply&&!confirm('Las traducciones se escribirán directamente en Shopify sin revisión previa en el hub. ¿Continuar?'))return;const run=document.querySelector('#prepare-batch');run.disabled=true;status.textContent='Creando la campaña…';try{const campaign=await fetchJSON('/api/translation-campaigns',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});location.href='/translation-campaigns#'+campaign.id}catch(err){status.textContent=err.message;run.disabled=false}});
 </script>'''
     return shell('Traducción en lote',body,'batch')
 
@@ -1085,17 +1086,8 @@ def resolve_es_product_by_sku(source_store,sku:str):
 
 @app.post('/api/translation-batches/resolve')
 def resolve_translation_batch_skus(x:TranslationBatchResolve,user=Depends(operator)):
-    """Group SKUs by their ES product so a campaign creates one batch per product."""
-    source_store=next((s for s in shopify_stores() if s['code']=='ES' and s['token']),None)
-    if not source_store: raise HTTPException(503,'La tienda ES no tiene dominio y token configurados')
-    groups={}; errors=[]
-    for sku in dict.fromkeys(v.strip() for v in x.skus if v.strip()):
-        try: product=resolve_es_product_by_sku(source_store,sku)
-        except HTTPException as exc:
-            errors.append({'sku':sku,'error':str(exc.detail)}); continue
-        group=groups.setdefault(product['id'],{'product_gid':product['id'],'title':product['title'],'skus':[]})
-        group['skus'].append(sku)
-    return {'groups':list(groups.values()),'errors':errors}
+    groups,errors=resolve_skus_to_groups(x.skus)
+    return {'groups':groups,'errors':errors}
 
 @app.post('/api/translation-batches/parse-skus')
 async def parse_translation_batch_skus(request:Request,filename:str='skus.txt',user=Depends(operator)):
@@ -1303,6 +1295,195 @@ def import_product(x:ImportProduct,user=Depends(operator)):
         if old and old[0]!=digest:
             c.execute("UPDATE localization_jobs SET state='STALE',reason='La fuente cambió desde la generación',updated_at=now() WHERE product_key=%s AND state IN ('READY_FOR_REVIEW','APPROVED')",(x.product_key,))
     return {'product_key':x.product_key,'source_version':ver,'source_hash':digest,'mapping_status':'manual confirmation required for unmapped destinations'}
+
+# ---- Translation campaigns: persisted SKU lists processed by a background runner ----
+CAMPAIGN_ACTIVE=('RESOLVING','RUNNING')
+CAMPAIGN_OPTION_KEYS={'fields','store','locale','variants_of_skus_only','auto_apply'}
+class TranslationCampaignRequest(TranslationBatchRequest):
+    sku:str=Field(default='',max_length=120)
+    skus:list[str]=Field(min_length=1,max_length=20000)
+
+def resolve_skus_to_groups(skus:list[str]):
+    """Group SKUs by their ES product so a campaign creates one batch per product."""
+    source_store=next((s for s in shopify_stores() if s['code']=='ES' and s['token']),None)
+    if not source_store: raise HTTPException(503,'La tienda ES no tiene dominio y token configurados')
+    groups={}; errors=[]
+    for sku in dict.fromkeys(v.strip() for v in skus if v.strip()):
+        try: product=resolve_es_product_by_sku(source_store,sku)
+        except HTTPException as exc:
+            errors.append({'sku':sku,'error':str(exc.detail)}); continue
+        group=groups.setdefault(product['id'],{'product_gid':product['id'],'title':product['title'],'skus':[]})
+        group['skus'].append(sku)
+    return list(groups.values()),errors
+
+def campaign_payload(campaign_id:int,items:bool=False):
+    with pool.connection() as c:
+        row=c.execute('SELECT id,state,options,skus,resolved,resolved_count,cancel_requested,error,created_at,updated_at,finished_at FROM translation_campaigns WHERE id=%s',(campaign_id,)).fetchone()
+        if not row: raise HTTPException(404,'Campaña no encontrada')
+        products={k:0 for k in ('PENDING','RUNNING','DONE','ERROR','CANCELLED')}
+        for state,n in c.execute('SELECT state,count(*) FROM translation_campaign_items WHERE campaign_id=%s GROUP BY state',(campaign_id,)).fetchall(): products[state]=n
+        fields={}
+        for state,n in c.execute('SELECT bi.state,count(*) FROM translation_batch_items bi JOIN translation_campaign_items ci ON ci.batch_id=bi.batch_id WHERE ci.campaign_id=%s GROUP BY bi.state',(campaign_id,)).fetchall(): fields[state]=n
+        current=c.execute("SELECT skus,title,started_at FROM translation_campaign_items WHERE campaign_id=%s AND state='RUNNING' ORDER BY position LIMIT 1",(campaign_id,)).fetchone()
+        avg=c.execute("SELECT avg(extract(epoch FROM finished_at-started_at)) FROM translation_campaign_items WHERE campaign_id=%s AND state IN ('DONE','ERROR') AND started_at IS NOT NULL AND finished_at IS NOT NULL",(campaign_id,)).fetchone()[0]
+        failed=[s for (skus,) in c.execute("SELECT skus FROM translation_campaign_items WHERE campaign_id=%s AND state='ERROR' ORDER BY position",(campaign_id,)).fetchall() for s in skus]
+        rows=[]
+        if items:
+            rows=c.execute('''SELECT ci.id,ci.position,ci.skus,ci.title,ci.state,ci.batch_id,ci.error,
+              count(bi.id) FILTER (WHERE bi.state='PENDING_REVIEW'),count(bi.id) FILTER (WHERE bi.state='APPROVED'),
+              count(bi.id) FILTER (WHERE bi.state='SAVED'),count(bi.id) FILTER (WHERE bi.state IN ('ERROR','APPLY_ERROR'))
+              FROM translation_campaign_items ci LEFT JOIN translation_batch_items bi ON bi.batch_id=ci.batch_id
+              WHERE ci.campaign_id=%s GROUP BY ci.id ORDER BY ci.position,ci.id''',(campaign_id,)).fetchall()
+    payload={'id':row[0],'state':row[1],'options':row[2],'total_skus':len(row[3]),'resolved':row[4],'resolved_count':row[5],'cancel_requested':row[6],'error':row[7],
+      'created_at':row[8],'updated_at':row[9],'finished_at':row[10],'products':products,'fields':fields,
+      'current':{'skus':current[0],'title':current[1],'started_at':current[2]} if current else None,
+      'avg_seconds':float(avg) if avg is not None else None,'failed_skus':failed}
+    if items: payload['items']=[dict(zip(('id','position','skus','title','state','batch_id','error','pending_review','approved','saved','errors'),r)) for r in rows]
+    return payload
+
+@app.post('/api/translation-campaigns')
+def create_translation_campaign(x:TranslationCampaignRequest,user=Depends(operator)):
+    skus=list(dict.fromkeys(s.strip() for s in x.skus if s.strip()))
+    if not skus: raise HTTPException(400,'Indica al menos un SKU')
+    if len(skus)>5000: raise HTTPException(400,'El máximo es 5.000 SKU por campaña')
+    options=x.model_dump(include=CAMPAIGN_OPTION_KEYS)
+    with pool.connection() as c:
+        campaign_id=c.execute('INSERT INTO translation_campaigns(options,skus) VALUES(%s,%s) RETURNING id',(Jsonb(options),skus)).fetchone()[0]
+    return campaign_payload(campaign_id)
+
+@app.get('/api/translation-campaigns')
+def list_translation_campaigns(user=Depends(operator)):
+    with pool.connection() as c:
+        ids=[r[0] for r in c.execute('SELECT id FROM translation_campaigns ORDER BY id DESC LIMIT 30').fetchall()]
+    return [campaign_payload(i) for i in ids]
+
+@app.get('/api/translation-campaigns/{campaign_id}')
+def get_translation_campaign(campaign_id:int,user=Depends(operator)):
+    return campaign_payload(campaign_id,items=True)
+
+@app.post('/api/translation-campaigns/{campaign_id}/cancel')
+def cancel_translation_campaign(campaign_id:int,user=Depends(operator)):
+    with pool.connection() as c:
+        updated=c.execute("UPDATE translation_campaigns SET cancel_requested=true,updated_at=now() WHERE id=%s AND state IN ('RESOLVING','RUNNING') RETURNING id",(campaign_id,)).fetchone()
+    if not updated: raise HTTPException(409,'La campaña no existe o ya terminó')
+    return campaign_payload(campaign_id)
+
+@app.post('/api/translation-campaigns/{campaign_id}/retry-failed')
+def retry_failed_translation_campaign(campaign_id:int,user=Depends(operator)):
+    """Start a new campaign with the SKUs that failed, keeping the original as history."""
+    with pool.connection() as c:
+        row=c.execute('SELECT options,state FROM translation_campaigns WHERE id=%s',(campaign_id,)).fetchone()
+        if not row: raise HTTPException(404,'Campaña no encontrada')
+        failed=[s for (skus,) in c.execute("SELECT skus FROM translation_campaign_items WHERE campaign_id=%s AND state IN ('ERROR','CANCELLED') ORDER BY position",(campaign_id,)).fetchall() for s in skus]
+        if not failed: raise HTTPException(409,'No hay SKU fallidos ni pendientes que reintentar')
+        new_id=c.execute('INSERT INTO translation_campaigns(options,skus) VALUES(%s,%s) RETURNING id',(Jsonb(row[0]),list(dict.fromkeys(failed)))).fetchone()[0]
+    return campaign_payload(new_id)
+
+def _campaign_finish(campaign_id:int):
+    with pool.connection() as c:
+        errors=c.execute("SELECT count(*) FROM translation_campaign_items WHERE campaign_id=%s AND state='ERROR'",(campaign_id,)).fetchone()[0]
+        c.execute("UPDATE translation_campaigns SET state=%s,updated_at=now(),finished_at=now() WHERE id=%s",('DONE_WITH_ERRORS' if errors else 'DONE',campaign_id))
+
+def _campaign_resolve(campaign_id:int,skus:list[str]):
+    by_product={}; errors=[]
+    for i in range(0,len(skus),50):
+        with pool.connection() as c:
+            if c.execute('SELECT cancel_requested FROM translation_campaigns WHERE id=%s',(campaign_id,)).fetchone()[0]: return False
+        chunk=skus[i:i+50]
+        try: groups,errs=resolve_skus_to_groups(chunk)
+        except Exception as exc:
+            msg=str(exc.detail if isinstance(exc,HTTPException) else exc)[:500]
+            groups,errs=[],[{'sku':s,'error':'No se pudo resolver este bloque de SKU: '+msg} for s in chunk]
+        for g in groups:
+            known=by_product.get(g['product_gid'])
+            if known: known['skus'].extend(g['skus'])
+            else: by_product[g['product_gid']]=g
+        errors.extend(errs)
+        with pool.connection() as c:
+            c.execute('UPDATE translation_campaigns SET resolved_count=%s,updated_at=now() WHERE id=%s',(min(i+50,len(skus)),campaign_id))
+    with pool.connection() as c:
+        c.execute('DELETE FROM translation_campaign_items WHERE campaign_id=%s',(campaign_id,))
+        position=0
+        for g in by_product.values():
+            c.execute('INSERT INTO translation_campaign_items(campaign_id,position,skus,product_gid,title) VALUES(%s,%s,%s,%s,%s)',(campaign_id,position,g['skus'],g['product_gid'],g['title'])); position+=1
+        for e in errors:
+            c.execute("INSERT INTO translation_campaign_items(campaign_id,position,skus,title,state,error,finished_at) VALUES(%s,%s,%s,'','ERROR',%s,now())",(campaign_id,position,[e['sku']],e['error'])); position+=1
+        c.execute("UPDATE translation_campaigns SET resolved=true,resolved_count=%s,state='RUNNING',updated_at=now() WHERE id=%s",(len(skus),campaign_id))
+    return True
+
+def _campaign_step():
+    """Do one unit of campaign work (resolve SKUs or prepare one product). False when idle."""
+    with pool.connection() as c:
+        row=c.execute("SELECT id,options,skus,resolved,cancel_requested FROM translation_campaigns WHERE state IN ('RESOLVING','RUNNING') ORDER BY id LIMIT 1").fetchone()
+    if not row: return False
+    campaign_id,options,skus,resolved,cancel=row
+    if cancel:
+        with pool.connection() as c:
+            c.execute("UPDATE translation_campaign_items SET state='CANCELLED',finished_at=now() WHERE campaign_id=%s AND state='PENDING'",(campaign_id,))
+            c.execute("UPDATE translation_campaigns SET state='CANCELLED',updated_at=now(),finished_at=now() WHERE id=%s",(campaign_id,))
+        return True
+    if not resolved:
+        _campaign_resolve(campaign_id,skus)
+        return True
+    with pool.connection() as c:
+        item=c.execute("""UPDATE translation_campaign_items SET state='RUNNING',started_at=now() WHERE id=(
+          SELECT id FROM translation_campaign_items WHERE campaign_id=%s AND state='PENDING' ORDER BY position LIMIT 1 FOR UPDATE SKIP LOCKED)
+          RETURNING id,skus""",(campaign_id,)).fetchone()
+    if not item:
+        _campaign_finish(campaign_id); return True
+    item_id,item_skus=item
+    try:
+        batch=create_translation_batch(TranslationBatchRequest(**options,sku=item_skus[0],also_skus=item_skus[1:51]),'local')
+        usable=[i for i in batch['items'] if i['state']!='ERROR']
+        state='DONE' if usable else 'ERROR'
+        error=None if usable else next((i['error'] for i in batch['items'] if i.get('error')),batch.get('error') or 'No se generó ningún campo')
+        batch_id=batch['id']
+    except Exception as exc:
+        state,batch_id,error='ERROR',None,str(exc.detail if isinstance(exc,HTTPException) else exc)[:500]
+    with pool.connection() as c:
+        c.execute('UPDATE translation_campaign_items SET state=%s,batch_id=%s,error=%s,finished_at=now() WHERE id=%s',(state,batch_id,error,item_id))
+        c.execute('UPDATE translation_campaigns SET updated_at=now() WHERE id=%s',(campaign_id,))
+    return True
+
+def _campaign_runner():
+    while True:
+        try: busy=_campaign_step()
+        except Exception:
+            logging.getLogger('hub.campaigns').exception('Error en el ejecutor de campañas'); busy=False
+        if not busy: time.sleep(3)
+
+@app.get('/translation-campaigns',response_class=HTMLResponse)
+def translation_campaigns_page():
+    body='''<main class="wrap"><h1>Campañas de traducción</h1><p class="lede">Las campañas se ejecutan en el servidor: puedes cerrar esta página o moverte por el hub y volver aquí para ver cómo van. Las propuestas se revisan en <a href="/translation-batches">Revisión de lotes</a>.</p><section class="card" aria-labelledby="campaign-list-title"><div class="section-heading"><h2 id="campaign-list-title">Campañas recientes</h2><a class="button" href="/products/batch">Nueva campaña</a></div><div id="campaign-list" aria-live="polite"><p class="muted">Cargando…</p></div></section><div id="campaign-detail"></div></main>
+<script>
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const list=document.querySelector('#campaign-list'),detail=document.querySelector('#campaign-detail');
+let openId=null,lastList='',lastTop='',lastItems='',itemFilter='';
+async function request(url,options){const r=await fetch(url,options);let d={};try{d=await r.json()}catch{}if(!r.ok)throw new Error(typeof d.detail==='string'?d.detail:'No se pudo completar la solicitud');return d}
+const date=s=>s?new Date(s).toLocaleString('es-ES'):'—';
+const STATE={RESOLVING:'Resolviendo SKU',RUNNING:'En curso',DONE:'Completada',DONE_WITH_ERRORS:'Completada con errores',CANCELLED:'Cancelada'};
+const ITEM_STATE={PENDING:'En cola',RUNNING:'Preparando…',DONE:'Preparado',ERROR:'Error',CANCELLED:'No procesado'};
+const isActive=c=>c.state==='RESOLVING'||c.state==='RUNNING';
+const total=c=>Object.values(c.products).reduce((a,b)=>a+b,0);
+const finished=c=>c.products.DONE+c.products.ERROR+c.products.CANCELLED;
+function pct(c){if(c.state==='RESOLVING')return c.total_skus?Math.round(100*c.resolved_count/c.total_skus):0;const t=total(c);return t?Math.round(100*finished(c)/t):100}
+function eta(c){if(c.state!=='RUNNING'||c.avg_seconds==null)return '';const left=(c.products.PENDING+c.products.RUNNING)*c.avg_seconds;if(left<90)return 'menos de 2 min';if(left<5400)return '≈ '+Math.round(left/60)+' min';return '≈ '+(left/3600).toFixed(1)+' h'}
+function bar(c){const p=pct(c);return `<progress max="100" value="${p}" aria-label="Progreso de la campaña ${c.id}" style="width:100%">${p}%</progress>`}
+function headline(c){if(c.state==='RESOLVING')return `Resolviendo SKU en ES: ${c.resolved_count} de ${c.total_skus}`;const t=total(c);if(c.state==='RUNNING'){const cur=c.current?` · ahora: ${esc(c.current.skus.join(', '))}`:'';return `Producto ${Math.min(finished(c)+1,t)} de ${t}${cur}`}return `${finished(c)} de ${t} productos procesados`}
+async function loadList(){try{const d=await request('/api/translation-campaigns');const html=d.length?`<div class="batch-table-scroll"><table><caption class="sr-only">Campañas recientes</caption><thead><tr><th scope="col">Campaña</th><th scope="col">Creada</th><th scope="col">SKU</th><th scope="col">Estado</th><th scope="col">Progreso</th></tr></thead><tbody>${d.map(c=>`<tr><td><a href="#${c.id}">#${c.id}</a></td><td>${date(c.created_at)}</td><td>${c.total_skus}</td><td>${STATE[c.state]||c.state}${c.cancel_requested&&isActive(c)?' (cancelando…)':''}</td><td style="min-width:140px">${bar(c)}<span class="muted">${pct(c)}%${c.products.ERROR?' · '+c.products.ERROR+' con error':''}</span></td></tr>`).join('')}</tbody></table></div>`:'<p class="muted">Todavía no hay campañas. Crea una desde Traducción en lote.</p>';if(html!==lastList){list.innerHTML=html;lastList=html}return d}catch(e){list.innerHTML=`<p class="batch-error" role="alert">${esc(e.message)}</p>`;return []}}
+function topHtml(c){const f=c.fields,p=c.products,e=eta(c);return `<section class="card" aria-labelledby="cd-title"><div class="section-heading"><h2 id="cd-title" tabindex="-1">Campaña #${c.id} · ${STATE[c.state]||c.state}</h2><div class="actions" style="margin:0">${isActive(c)?`<button type="button" class="secondary" data-act="cancel"${c.cancel_requested?' disabled':''}>${c.cancel_requested?'Cancelando…':'Cancelar campaña'}</button>`:''}${!isActive(c)&&(p.ERROR||p.CANCELLED)?'<button type="button" class="secondary" data-act="retry">Reintentar fallidos y no procesados</button>':''}</div></div>${bar(c)}<p><strong>${pct(c)}%</strong> · ${headline(c)}${e?' · quedan '+e:''}</p><p class="muted">Creada ${date(c.created_at)}${c.finished_at?' · terminada '+date(c.finished_at):' · última actividad '+date(c.updated_at)}${c.options.auto_apply?' · <strong>aplica directamente en Shopify</strong>':''}</p><ul class="muted"><li>Productos: ${p.DONE} preparados, ${p.ERROR} con error, ${p.PENDING+p.RUNNING} en cola${p.CANCELLED?', '+p.CANCELLED+' sin procesar':''}.</li><li>Campos: ${f.PENDING_REVIEW||0} pendientes de revisión, ${f.APPROVED||0} aprobados sin aplicar, ${f.SAVED||0} subidos a Shopify, ${(f.ERROR||0)+(f.APPLY_ERROR||0)} con error.</li></ul><div class="actions"><a class="button secondary" href="/translation-batches">Ir a Revisión de lotes</a></div><p id="cd-status" class="status" role="status"></p></section>`}
+function itemsHtml(c){const rows=c.items.filter(i=>!itemFilter||(itemFilter==='PROBLEMS'?(i.state==='ERROR'||i.errors>0):i.state===itemFilter));const failed=c.failed_skus.length?`<div class="card"><h3>SKU con error (${c.failed_skus.length})</h3><p class="muted">Copia esta lista para reintentarla.</p><textarea readonly rows="4" style="width:100%">${esc(c.failed_skus.join(String.fromCharCode(10)))}</textarea></div>`:'';return failed+`<div class="batch-table-scroll"><table><caption class="sr-only">Productos de la campaña</caption><thead><tr><th scope="col">#</th><th scope="col">SKU</th><th scope="col">Producto</th><th scope="col">Estado</th><th scope="col">Campos</th><th scope="col">Lote</th></tr></thead><tbody>${rows.map(i=>`<tr><td>${i.position+1}</td><td>${esc(i.skus.join(', '))}</td><td>${esc(i.title)}</td><td>${ITEM_STATE[i.state]||i.state}${i.error?`<br><span class="batch-error">${esc(i.error)}</span>`:''}</td><td>${i.batch_id?`${i.pending_review} rev. · ${i.approved} aprob. · ${i.saved} subidos${i.errors?' · '+i.errors+' error':''}`:'—'}</td><td>${i.batch_id?`<a href="/translation-batches#${i.batch_id}">#${i.batch_id}</a>`:'—'}</td></tr>`).join('')||'<tr><td colspan="6" class="muted">Sin productos para este filtro.</td></tr>'}</tbody></table></div>`}
+function buildDetail(){detail.innerHTML='<div id="cd-top"></div><section class="card"><div class="section-heading"><h2>Productos</h2><label>Filtrar <select id="cd-filter"><option value="">Todos</option><option value="PROBLEMS">Con problemas</option><option value="ERROR">Con error</option><option value="RUNNING">En curso</option><option value="PENDING">En cola</option><option value="DONE">Preparados</option></select></label></div><div id="cd-items"></div></section>';detail.querySelector('#cd-filter').addEventListener('change',e=>{itemFilter=e.target.value;lastItems='';refresh()})}
+async function loadDetail(){if(!openId)return null;try{const c=await request('/api/translation-campaigns/'+openId);if(!detail.querySelector('#cd-top'))buildDetail();const top=topHtml(c),items=itemsHtml(c);if(top!==lastTop){detail.querySelector('#cd-top').innerHTML=top;lastTop=top}if(items!==lastItems){detail.querySelector('#cd-items').innerHTML=items;lastItems=items}return c}catch(e){detail.innerHTML=`<section class="card"><p class="batch-error" role="alert">${esc(e.message)}</p></section>`;lastTop=lastItems='';return null}}
+detail.addEventListener('click',async e=>{const btn=e.target.closest('[data-act]');if(!btn)return;const st=detail.querySelector('#cd-status');btn.disabled=true;try{if(btn.dataset.act==='cancel'){if(!confirm('¿Cancelar la campaña? Se termina el producto en curso y el resto queda sin procesar; lo ya preparado se conserva.')){btn.disabled=false;return}await request('/api/translation-campaigns/'+openId+'/cancel',{method:'POST'})}else{const c=await request('/api/translation-campaigns/'+openId+'/retry-failed',{method:'POST'});location.hash=c.id}refresh()}catch(err){if(st)st.textContent=err.message;btn.disabled=false}});
+let busy=false;
+async function refresh(){if(busy)return;busy=true;try{const [d]=await Promise.all([loadList(),loadDetail()]);return d}finally{busy=false}}
+function select(){const m=location.hash.match(/^#([0-9]+)$/);const id=m?Number(m[1]):null;if(id!==openId){openId=id;lastTop=lastItems='';detail.innerHTML='';itemFilter=''}refresh().then(()=>{if(openId)detail.querySelector('#cd-title')?.focus({preventScroll:false})})}
+window.addEventListener('hashchange',select);
+setInterval(()=>{if(!document.hidden)refresh()},3000);
+select();
+</script>'''
+    return shell('Campañas de traducción',body,'campaigns')
 
 @app.post('/api/jobs/enqueue')
 def enqueue(x:Enqueue,user=Depends(operator)):

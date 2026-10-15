@@ -31,6 +31,30 @@ def _html_tags(value):
     return Counter(parser.tags)
 
 
+# Inline formatting tags: translation reorders words, so the engine may split,
+# merge or move emphasis. Their count is not meaningful; only whether each kind
+# is still used. Every other tag (blocks, lists, links, br, img...) must match exactly.
+_INLINE_TAGS = {"strong", "b", "em", "i", "u", "s", "span", "small", "mark", "sub", "sup", "abbr", "font"}
+
+
+def html_structure_diff(source, proposal):
+    """Return human-readable structural differences, or None if HTML can't be parsed."""
+    source_tags, proposal_tags = _html_tags(source), _html_tags(proposal)
+    if source_tags is None or proposal_tags is None:
+        return None
+    diffs = []
+    for tag in sorted({t for t, _ in [*source_tags, *proposal_tags]}):
+        for closed in (False, True):
+            before, after = source_tags.get((tag, closed), 0), proposal_tags.get((tag, closed), 0)
+            if tag in _INLINE_TAGS:
+                if closed or (before > 0) == (after > 0):
+                    continue
+            elif before == after:
+                continue
+            diffs.append(f"<{tag}{'/' if closed else ''}> {before}→{after}")
+    return diffs
+
+
 # Double quotation marks in the usual typographic styles (straight, German,
 # English, French) plus their HTML entity forms.
 _QUOTE_CHARS = '"„“”‟«»'
@@ -102,11 +126,12 @@ def assess_translation(source, proposal, *, is_html=False):
                    "missing": sorted(missing_placeholders.elements())})
 
     if is_html:
-        source_tags, proposal_tags = _html_tags(source), _html_tags(proposal)
-        tags_ok = source_tags is not None and source_tags == proposal_tags
+        diffs = html_structure_diff(source, proposal)
+        tags_ok = diffs == []
         if not tags_ok:
-            hard_failures.append("La estructura HTML no coincide con el texto de origen")
-        checks.append({"name": "html_structure", "passed": tags_ok})
+            detail = ": " + ", ".join(diffs[:6]) if diffs else ""
+            hard_failures.append("La estructura HTML no coincide con el texto de origen" + detail)
+        checks.append({"name": "html_structure", "passed": tags_ok, "differences": diffs or []})
 
     source_len, proposal_len = len(re.sub(r"<[^>]*>", " ", source).strip()), len(re.sub(r"<[^>]*>", " ", proposal).strip())
     ratio = proposal_len / max(source_len, 1)
