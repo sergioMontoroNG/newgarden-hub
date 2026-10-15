@@ -1140,6 +1140,7 @@ def create_translation_batch(x:TranslationBatchRequest,user=Depends(operator)):
             c.execute("UPDATE translation_batches SET state='READY_WITH_ERRORS',error=%s,updated_at=now() WHERE id=%s",(str(exc.detail)[:500],batch_id))
         return translation_batch_payload(batch_id)
     empty_message='Ninguno de los campos seleccionados existe, tiene contenido en origen o tiene equivalente editable en este destino' if x.fields is not None else 'No se encontró un producto equivalente o campos principales editables en el destino'
+    quota_error=None  # once DeepL reports no quota left, remaining fields fail fast instead of calling it again
     for store_code,locale in targets:
         column_index=next((i for i,column in enumerate(comparison['columns']) if i>0 and column['label'].startswith(f'{store_code} · {locale}')),None)
         target_items=0
@@ -1152,13 +1153,17 @@ def create_translation_batch(x:TranslationBatchRequest,user=Depends(operator)):
             source_text=(edit.get('source_value') if field['key'].startswith('metafield.') and edit else field['values'][0] if field.get('values') else '')
             if not edit or not source_text: continue
             try:
+                if quota_error: raise RuntimeError(quota_error)
                 request=CellTranslateRequest(source_text=source_text,source_store='ES',source_locale=source_locale,target_store=store_code,target_locale=locale,field_key=edit['key'],metafield_type=edit.get('metafield_type'),html=field['key']=='descriptionHtml' or edit.get('metafield_type')=='html')
                 translated=translate_cell(request,user)
                 proposed=translated['translation']; error=None
                 quality=assess_translation(source_text,proposed,is_html=request.html)
-                state='APPROVED' if quality['status']=='PASS' and (x.auto_apply or (not translated.get('require_review') and field['key']!='handle' and os.getenv('QUALITY_AUTO_APPROVE','true').lower() in ('1','true','yes','on'))) else 'PENDING_REVIEW'
+                # With auto_apply the operator asked for translate-and-publish: the integrity score stays
+                # recorded on the item but never holds back a non-empty translation.
+                state='APPROVED' if (x.auto_apply and (proposed or '').strip()) or (quality['status']=='PASS' and not translated.get('require_review') and field['key']!='handle' and os.getenv('QUALITY_AUTO_APPROVE','true').lower() in ('1','true','yes','on')) else 'PENDING_REVIEW'
             except Exception as exc:
                 proposed=None; quality=None; state='ERROR'; error=str(exc.detail if isinstance(exc,HTTPException) else exc)[:500]
+                if error.startswith('DEEPL_QUOTA'): quota_error=error
             with pool.connection() as c:
                 c.execute('''INSERT INTO translation_batch_items(batch_id,store_code,locale,field_key,field_label,source_text,proposed_text,edit_payload,state,error,quality)
                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(batch_id,store_code,locale,field_key) DO NOTHING''',
@@ -1364,8 +1369,19 @@ def get_translation_campaign(campaign_id:int,user=Depends(operator)):
 @app.post('/api/translation-campaigns/{campaign_id}/cancel')
 def cancel_translation_campaign(campaign_id:int,user=Depends(operator)):
     with pool.connection() as c:
-        updated=c.execute("UPDATE translation_campaigns SET cancel_requested=true,updated_at=now() WHERE id=%s AND state IN ('RESOLVING','RUNNING') RETURNING id",(campaign_id,)).fetchone()
+        updated=c.execute("UPDATE translation_campaigns SET cancel_requested=true,updated_at=now() WHERE id=%s AND state IN ('RESOLVING','RUNNING','PAUSED') RETURNING id,state",(campaign_id,)).fetchone()
+        if updated and updated[1]=='PAUSED':
+            # The runner skips paused campaigns, so close it here.
+            c.execute("UPDATE translation_campaign_items SET state='CANCELLED',finished_at=now() WHERE campaign_id=%s AND state='PENDING'",(campaign_id,))
+            c.execute("UPDATE translation_campaigns SET state='CANCELLED',finished_at=now() WHERE id=%s",(campaign_id,))
     if not updated: raise HTTPException(409,'La campaña no existe o ya terminó')
+    return campaign_payload(campaign_id)
+
+@app.post('/api/translation-campaigns/{campaign_id}/resume')
+def resume_translation_campaign(campaign_id:int,user=Depends(operator)):
+    with pool.connection() as c:
+        updated=c.execute("UPDATE translation_campaigns SET state='RUNNING',error=NULL,updated_at=now() WHERE id=%s AND state='PAUSED' RETURNING id",(campaign_id,)).fetchone()
+    if not updated: raise HTTPException(409,'Solo se puede reanudar una campaña en pausa')
     return campaign_payload(campaign_id)
 
 @app.post('/api/translation-campaigns/{campaign_id}/retry-failed')
@@ -1434,12 +1450,24 @@ def _campaign_step():
     item_id,item_skus=item
     try:
         batch=create_translation_batch(TranslationBatchRequest(**options,sku=item_skus[0],also_skus=item_skus[1:51]),'local')
+        quota=next((i['error'] for i in batch['items'] if (i.get('error') or '').startswith('DEEPL_QUOTA')),None)
+        if quota:
+            # No DeepL quota left: put the product back in the queue and pause the whole campaign.
+            with pool.connection() as c:
+                c.execute("UPDATE translation_campaign_items SET state='PENDING',batch_id=%s,started_at=NULL WHERE id=%s",(batch['id'],item_id))
+                c.execute("UPDATE translation_campaigns SET state='PAUSED',error=%s,updated_at=now() WHERE id=%s",('Cuota de DeepL agotada: la campaña está en pausa. Amplía el plan o espera a la renovación y pulsa Reanudar.',campaign_id))
+            return True
         usable=[i for i in batch['items'] if i['state']!='ERROR']
         state='DONE' if usable else 'ERROR'
         error=None if usable else next((i['error'] for i in batch['items'] if i.get('error')),batch.get('error') or 'No se generó ningún campo')
         batch_id=batch['id']
     except Exception as exc:
         state,batch_id,error='ERROR',None,str(exc.detail if isinstance(exc,HTTPException) else exc)[:500]
+        if error.startswith('DEEPL_QUOTA'):
+            with pool.connection() as c:
+                c.execute("UPDATE translation_campaign_items SET state='PENDING',started_at=NULL WHERE id=%s",(item_id,))
+                c.execute("UPDATE translation_campaigns SET state='PAUSED',error=%s,updated_at=now() WHERE id=%s",('Cuota de DeepL agotada: la campaña está en pausa. Amplía el plan o espera a la renovación y pulsa Reanudar.',campaign_id))
+            return True
     with pool.connection() as c:
         c.execute('UPDATE translation_campaign_items SET state=%s,batch_id=%s,error=%s,finished_at=now() WHERE id=%s',(state,batch_id,error,item_id))
         c.execute('UPDATE translation_campaigns SET updated_at=now() WHERE id=%s',(campaign_id,))
@@ -1461,9 +1489,9 @@ const list=document.querySelector('#campaign-list'),detail=document.querySelecto
 let openId=null,lastList='',lastTop='',lastItems='',itemFilter='';
 async function request(url,options){const r=await fetch(url,options);let d={};try{d=await r.json()}catch{}if(!r.ok)throw new Error(typeof d.detail==='string'?d.detail:'No se pudo completar la solicitud');return d}
 const date=s=>s?new Date(s).toLocaleString('es-ES'):'—';
-const STATE={RESOLVING:'Resolviendo SKU',RUNNING:'En curso',DONE:'Completada',DONE_WITH_ERRORS:'Completada con errores',CANCELLED:'Cancelada'};
+const STATE={RESOLVING:'Resolviendo SKU',RUNNING:'En curso',DONE:'Completada',DONE_WITH_ERRORS:'Completada con errores',CANCELLED:'Cancelada',PAUSED:'En pausa (cuota DeepL)'};
 const ITEM_STATE={PENDING:'En cola',RUNNING:'Preparando…',DONE:'Preparado',ERROR:'Error',CANCELLED:'No procesado'};
-const isActive=c=>c.state==='RESOLVING'||c.state==='RUNNING';
+const isActive=c=>c.state==='RESOLVING'||c.state==='RUNNING'||c.state==='PAUSED';
 const total=c=>Object.values(c.products).reduce((a,b)=>a+b,0);
 const finished=c=>c.products.DONE+c.products.ERROR+c.products.CANCELLED;
 function pct(c){if(c.state==='RESOLVING')return c.total_skus?Math.round(100*c.resolved_count/c.total_skus):0;const t=total(c);return t?Math.round(100*finished(c)/t):100}
@@ -1471,11 +1499,11 @@ function eta(c){if(c.state!=='RUNNING'||c.avg_seconds==null)return '';const left
 function bar(c){const p=pct(c);return `<progress max="100" value="${p}" aria-label="Progreso de la campaña ${c.id}" style="width:100%">${p}%</progress>`}
 function headline(c){if(c.state==='RESOLVING')return `Resolviendo SKU en ES: ${c.resolved_count} de ${c.total_skus}`;const t=total(c);if(c.state==='RUNNING'){const cur=c.current?` · ahora: ${esc(c.current.skus.join(', '))}`:'';return `Producto ${Math.min(finished(c)+1,t)} de ${t}${cur}`}return `${finished(c)} de ${t} productos procesados`}
 async function loadList(){try{const d=await request('/api/translation-campaigns');const html=d.length?`<div class="batch-table-scroll"><table><caption class="sr-only">Campañas recientes</caption><thead><tr><th scope="col">Campaña</th><th scope="col">Creada</th><th scope="col">SKU</th><th scope="col">Estado</th><th scope="col">Progreso</th></tr></thead><tbody>${d.map(c=>`<tr><td><a href="#${c.id}">#${c.id}</a></td><td>${date(c.created_at)}</td><td>${c.total_skus}</td><td>${STATE[c.state]||c.state}${c.cancel_requested&&isActive(c)?' (cancelando…)':''}</td><td style="min-width:140px">${bar(c)}<span class="muted">${pct(c)}%${c.products.ERROR?' · '+c.products.ERROR+' con error':''}</span></td></tr>`).join('')}</tbody></table></div>`:'<p class="muted">Todavía no hay campañas. Crea una desde Traducción en lote.</p>';if(html!==lastList){list.innerHTML=html;lastList=html}return d}catch(e){list.innerHTML=`<p class="batch-error" role="alert">${esc(e.message)}</p>`;return []}}
-function topHtml(c){const f=c.fields,p=c.products,e=eta(c);return `<section class="card" aria-labelledby="cd-title"><div class="section-heading"><h2 id="cd-title" tabindex="-1">Campaña #${c.id} · ${STATE[c.state]||c.state}</h2><div class="actions" style="margin:0">${isActive(c)?`<button type="button" class="secondary" data-act="cancel"${c.cancel_requested?' disabled':''}>${c.cancel_requested?'Cancelando…':'Cancelar campaña'}</button>`:''}${!isActive(c)&&(p.ERROR||p.CANCELLED)?'<button type="button" class="secondary" data-act="retry">Reintentar fallidos y no procesados</button>':''}</div></div>${bar(c)}<p><strong>${pct(c)}%</strong> · ${headline(c)}${e?' · quedan '+e:''}</p><p class="muted">Creada ${date(c.created_at)}${c.finished_at?' · terminada '+date(c.finished_at):' · última actividad '+date(c.updated_at)}${c.options.auto_apply?' · <strong>aplica directamente en Shopify</strong>':''}</p><ul class="muted"><li>Productos: ${p.DONE} preparados, ${p.ERROR} con error, ${p.PENDING+p.RUNNING} en cola${p.CANCELLED?', '+p.CANCELLED+' sin procesar':''}.</li><li>Campos: ${f.PENDING_REVIEW||0} pendientes de revisión, ${f.APPROVED||0} aprobados sin aplicar, ${f.SAVED||0} subidos a Shopify, ${(f.ERROR||0)+(f.APPLY_ERROR||0)} con error.</li></ul><div class="actions"><a class="button secondary" href="/translation-batches">Ir a Revisión de lotes</a></div><p id="cd-status" class="status" role="status"></p></section>`}
+function topHtml(c){const f=c.fields,p=c.products,e=eta(c);return `<section class="card" aria-labelledby="cd-title"><div class="section-heading"><h2 id="cd-title" tabindex="-1">Campaña #${c.id} · ${STATE[c.state]||c.state}</h2><div class="actions" style="margin:0">${c.state==='PAUSED'?'<button type="button" data-act="resume">Reanudar</button>':''}${isActive(c)?`<button type="button" class="secondary" data-act="cancel"${c.cancel_requested?' disabled':''}>${c.cancel_requested?'Cancelando…':'Cancelar campaña'}</button>`:''}${!isActive(c)&&(p.ERROR||p.CANCELLED)?'<button type="button" class="secondary" data-act="retry">Reintentar fallidos y no procesados</button>':''}</div></div>${c.error?`<p class="batch-error" role="alert">${esc(c.error)}</p>`:''}${bar(c)}<p><strong>${pct(c)}%</strong> · ${headline(c)}${e?' · quedan '+e:''}</p><p class="muted">Creada ${date(c.created_at)}${c.finished_at?' · terminada '+date(c.finished_at):' · última actividad '+date(c.updated_at)}${c.options.auto_apply?' · <strong>aplica directamente en Shopify</strong>':''}</p><ul class="muted"><li>Productos: ${p.DONE} preparados, ${p.ERROR} con error, ${p.PENDING+p.RUNNING} en cola${p.CANCELLED?', '+p.CANCELLED+' sin procesar':''}.</li><li>Campos: ${f.PENDING_REVIEW||0} pendientes de revisión, ${f.APPROVED||0} aprobados sin aplicar, ${f.SAVED||0} subidos a Shopify, ${(f.ERROR||0)+(f.APPLY_ERROR||0)} con error.</li></ul><div class="actions"><a class="button secondary" href="/translation-batches">Ir a Revisión de lotes</a></div><p id="cd-status" class="status" role="status"></p></section>`}
 function itemsHtml(c){const rows=c.items.filter(i=>!itemFilter||(itemFilter==='PROBLEMS'?(i.state==='ERROR'||i.errors>0):i.state===itemFilter));const failed=c.failed_skus.length?`<div class="card"><h3>SKU con error (${c.failed_skus.length})</h3><p class="muted">Copia esta lista para reintentarla.</p><textarea readonly rows="4" style="width:100%">${esc(c.failed_skus.join(String.fromCharCode(10)))}</textarea></div>`:'';return failed+`<div class="batch-table-scroll"><table><caption class="sr-only">Productos de la campaña</caption><thead><tr><th scope="col">#</th><th scope="col">SKU</th><th scope="col">Producto</th><th scope="col">Estado</th><th scope="col">Campos</th><th scope="col">Lote</th></tr></thead><tbody>${rows.map(i=>`<tr><td>${i.position+1}</td><td>${esc(i.skus.join(', '))}</td><td>${esc(i.title)}</td><td>${ITEM_STATE[i.state]||i.state}${i.error?`<br><span class="batch-error">${esc(i.error)}</span>`:''}</td><td>${i.batch_id?`${i.pending_review} rev. · ${i.approved} aprob. · ${i.saved} subidos${i.errors?' · '+i.errors+' error':''}`:'—'}</td><td>${i.batch_id?`<a href="/translation-batches#${i.batch_id}">#${i.batch_id}</a>`:'—'}</td></tr>`).join('')||'<tr><td colspan="6" class="muted">Sin productos para este filtro.</td></tr>'}</tbody></table></div>`}
 function buildDetail(){detail.innerHTML='<div id="cd-top"></div><section class="card"><div class="section-heading"><h2>Productos</h2><label>Filtrar <select id="cd-filter"><option value="">Todos</option><option value="PROBLEMS">Con problemas</option><option value="ERROR">Con error</option><option value="RUNNING">En curso</option><option value="PENDING">En cola</option><option value="DONE">Preparados</option></select></label></div><div id="cd-items"></div></section>';detail.querySelector('#cd-filter').addEventListener('change',e=>{itemFilter=e.target.value;lastItems='';refresh()})}
 async function loadDetail(){if(!openId)return null;try{const c=await request('/api/translation-campaigns/'+openId);if(!detail.querySelector('#cd-top'))buildDetail();const top=topHtml(c),items=itemsHtml(c);if(top!==lastTop){detail.querySelector('#cd-top').innerHTML=top;lastTop=top}if(items!==lastItems){detail.querySelector('#cd-items').innerHTML=items;lastItems=items}return c}catch(e){detail.innerHTML=`<section class="card"><p class="batch-error" role="alert">${esc(e.message)}</p></section>`;lastTop=lastItems='';return null}}
-detail.addEventListener('click',async e=>{const btn=e.target.closest('[data-act]');if(!btn)return;const st=detail.querySelector('#cd-status');btn.disabled=true;try{if(btn.dataset.act==='cancel'){if(!confirm('¿Cancelar la campaña? Se termina el producto en curso y el resto queda sin procesar; lo ya preparado se conserva.')){btn.disabled=false;return}await request('/api/translation-campaigns/'+openId+'/cancel',{method:'POST'})}else{const c=await request('/api/translation-campaigns/'+openId+'/retry-failed',{method:'POST'});location.hash=c.id}refresh()}catch(err){if(st)st.textContent=err.message;btn.disabled=false}});
+detail.addEventListener('click',async e=>{const btn=e.target.closest('[data-act]');if(!btn)return;const st=detail.querySelector('#cd-status');btn.disabled=true;try{if(btn.dataset.act==='cancel'){if(!confirm('¿Cancelar la campaña? Se termina el producto en curso y el resto queda sin procesar; lo ya preparado se conserva.')){btn.disabled=false;return}await request('/api/translation-campaigns/'+openId+'/cancel',{method:'POST'})}else if(btn.dataset.act==='resume'){await request('/api/translation-campaigns/'+openId+'/resume',{method:'POST'})}else{const c=await request('/api/translation-campaigns/'+openId+'/retry-failed',{method:'POST'});location.hash=c.id}refresh()}catch(err){if(st)st.textContent=err.message;btn.disabled=false}});
 let busy=false;
 async function refresh(){if(busy)return;busy=true;try{const [d]=await Promise.all([loadList(),loadDetail()]);return d}finally{busy=false}}
 function select(){const m=location.hash.match(/^#([0-9]+)$/);const id=m?Number(m[1]):null;if(id!==openId){openId=id;lastTop=lastItems='';detail.innerHTML='';itemFilter=''}refresh().then(()=>{if(openId)detail.querySelector('#cd-title')?.focus({preventScroll:false})})}
