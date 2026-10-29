@@ -17,7 +17,7 @@ jobs:
     runs-on: [self-hosted, newgarden-vm]
     timeout-minutes: 15
     env:
-      DEPLOY_DIR: /home/sergioM/services/newgarden-content-hub
+      DEPLOY_DIR: /srv/services/newgarden-content-hub
     steps:
       - name: Sync working copy to origin/main
         run: |
