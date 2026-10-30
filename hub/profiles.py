@@ -17,6 +17,15 @@ def active_profiles(store_code):
     return {r[1].lower(): _row(r) for r in rows}
 
 
+def list_active_profiles():
+    """Todos los perfiles activos, ordenados por tienda y locale."""
+    with pool.connection() as c:
+        rows = c.execute(
+            f"SELECT {','.join(_COLUMNS)} FROM translation_profiles WHERE active ORDER BY store_code, shopify_locale"
+        ).fetchall()
+    return [_row(r) for r in rows]
+
+
 def target_profile(store_code, locale):
     """Perfil activo con destino DeepL para (tienda, locale), o None si no es traducible."""
     profile = active_profiles(store_code).get((locale or '').lower())

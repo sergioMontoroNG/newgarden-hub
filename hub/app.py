@@ -10,7 +10,7 @@ from psycopg.types.json import Jsonb
 from .db import pool, initialize
 from .skufile import extract_skus
 from .quality import assess_translation, strip_added_quotes
-from .profiles import active_profiles, target_profile
+from .profiles import active_profiles, list_active_profiles, target_profile
 
 def operator():
     # This service is intended to be reachable only on the trusted local network.
@@ -448,6 +448,11 @@ def list_stores():
     with pool.connection() as c:
         rows=c.execute("SELECT s.code,s.domain,s.active,COALESCE(s.config->>'admin_token','')<>'',COALESCE(array_agg(l.locale) FILTER (WHERE l.locale IS NOT NULL),'{}') FROM stores s LEFT JOIN store_locales l ON l.store_code=s.code GROUP BY s.code ORDER BY s.code").fetchall()
     return [{'code':r[0],'domain':r[1] or '', 'active':r[2], 'has_token':r[3], 'locales':r[4]} for r in rows]
+
+@app.get('/api/translation-profiles')
+def list_translation_profiles():
+    """Perfiles activos (tienda, locale, rol, idioma DeepL); solo lectura, para herramientas externas."""
+    return [{k:p[k] for k in ('store_code','shopify_locale','role','deepl_target')} for p in list_active_profiles()]
 
 @app.get('/api/stores/{code}/shop-locales')
 def shop_locales(code:str):
